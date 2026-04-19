@@ -1,0 +1,32 @@
+# Node modules
+/node_modules
+.env
+.env.local
+.localappdata/
+.npm-cache/
+__pycache__/
+*.pyc
+*.log
+*.db
+private-key.pem
+
+# Compilation output
+/dist
+
+# pnpm deploy output
+/bundle
+
+# Hardhat Build Artifacts
+/artifacts
+
+# Hardhat compilation (v2) support directory
+/cache
+
+# Typechain output
+/types
+
+# Hardhat coverage reports
+/coverage
+
+# Deployment outputs
+/deployments

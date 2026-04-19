@@ -1,0 +1,33 @@
+{
+  "name": "evfi-phase1-prototype",
+  "version": "1.0.0",
+  "description": "EvFi unified repo with Sepolia contracts and Tesla telemetry app",
+  "main": "evfi_assign_rewards.mjs",
+  "scripts": {
+    "clean": "hardhat clean",
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
+    "assign:rewards": "hardhat run scripts/assignRewards.ts --network sepolia",
+    "assign:reward": "node evfi_assign_rewards.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ignition": "^0.15.16",
+    "@nomicfoundation/hardhat-toolbox": "^7.0.0",
+    "@openzeppelin/contracts": "^5.6.1",
+    "@types/chai": "^4.3.20",
+    "@types/chai-as-promised": "^7.1.8",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.19.17",
+    "chai": "^4.5.0",
+    "dotenv": "^17.4.1",
+    "ethers": "^6.16.0",
+    "hardhat": "^3.3.0",
+    "mocha": "^7.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.8.0"
+  }
+}

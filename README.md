@@ -14,10 +14,10 @@ It is structured as a single repo for the full demo stack:
 
 
 
-![Dashboard overview](dashboard-overview.png)
-![Wallet connected](wallet-connected.png)
-![Rewards claim flow](rewards-claim-flow.png)
-![rewards history and car data](ledger.png)
+![Dashboard overview](docs/screenshots/dashboard-overview.png)
+![Wallet connected](docs/screenshots/wallet-connected.png)
+![Rewards claim flow](docs/screenshots/rewards-claim-flow.png)
+![rewards history and car data](docs/screenshots/ledger.png)
 
 ## What The Demo Does
 

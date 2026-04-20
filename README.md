@@ -17,6 +17,7 @@ Add screenshots to `docs/screenshots/` using the filenames below and they will r
 ![Dashboard overview](docs/screenshots/dashboard-overview.png)
 ![Wallet connected](docs/screenshots/wallet-connected.png)
 ![Rewards claim flow](docs/screenshots/rewards-claim-flow.png)
+![rewards history and car data](docs/screenshots/ledger.png)
 
 ## What The Demo Does
 
@@ -157,4 +158,4 @@ If you are testing through ngrok, update both Tesla developer settings and `TESL
 
 ## Status
 
-This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase.
+This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase, new features and improvements will come in V2 and V3. contract adress: [contract adress](https://sepolia.etherscan.io/address/0x54aa3969B00Eb246df89b4552E80A06fF9B9C1ca)0x54aa3969B00Eb246df89b4552E80A06fF9B9C1ca

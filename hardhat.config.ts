@@ -1,5 +1,4 @@
 import { HardhatUserConfig } from "hardhat/config";
-import "@nomicfoundation/hardhat-toolbox";
 import * as dotenv from "dotenv";
 dotenv.config();
 
@@ -27,8 +26,9 @@ const config: HardhatUserConfig = {
   },
   networks: {
     ...(sepoliaUrl
-      ? {
+        ? {
           sepolia: {
+            type: "http",
             url: sepoliaUrl,
             accounts: deployerKey ? [deployerKey] : [],
           },

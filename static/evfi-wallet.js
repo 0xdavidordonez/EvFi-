@@ -16,8 +16,11 @@
     claimable: document.getElementById("claimableRewardsValue"),
     balance: document.getElementById("walletBalanceValue"),
     claim: document.getElementById("claimRewardsButton"),
+    claimAirdrop: document.getElementById("claimAirdropButton"),
     assign: document.getElementById("assignRewardsButton"),
     refreshAndDistribute: document.getElementById("refreshAndDistributeButton"),
+    sportMode: document.getElementById("sportModeButton"),
+    sportModeStatus: document.getElementById("sportModeStatus"),
     adminKey: document.getElementById("adminKeyInput"),
     distributionRecipient: document.getElementById("distributionRecipientInput"),
   };
@@ -127,7 +130,14 @@
 
   function formatToken(value) {
     return Number(ethers.formatUnits(value, 18)).toLocaleString(undefined, {
-      maximumFractionDigits: 4,
+      maximumFractionDigits: 2,
+    });
+  }
+
+  function formatNumber(value) {
+    return Number(value || 0).toLocaleString(undefined, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
     });
   }
 
@@ -444,7 +454,7 @@
       console.log("Transaction hash:", payload.txHash);
       setStatus(`Mileage sync and EVFI distribution confirmed: ${payload.batchId}`);
       setTxExplorer(payload.txHash || "");
-      setHint(`Assigned ${payload.amountTokens} EVFI to ${payload.wallet}. ${payload.txHash ? `Sepolia tx: ${payload.txHash}. ` : ""}Claim from that wallet to verify the end-to-end token flow.`);
+      setHint(`Assigned ${formatNumber(payload.amountTokens)} EVFI to ${payload.wallet}. ${payload.txHash ? `Sepolia tx: ${payload.txHash}. ` : ""}Claim from that wallet to verify the end-to-end token flow.`);
       showToast("EVFI tokens successfully airdropped.", "success");
       console.log("Transaction confirmed");
       await refreshChainData();
@@ -461,6 +471,127 @@
     }
   }
 
+  async function claimAirdrop() {
+    const vehicleId = els.claimAirdrop?.dataset.vehicleId;
+    const adminKey = els.adminKey?.value?.trim();
+    const recipientWallet = getRecipientWallet();
+
+    if (!vehicleId) {
+      setStatus("Vehicle context is missing for airdrop claim.", true);
+      return;
+    }
+
+    if (!adminKey) {
+      setStatus("Enter the admin API key to claim the first-login mileage airdrop.", true);
+      return;
+    }
+
+    try {
+      await validateSyncAirdropPrereqs();
+      setActionButtonState(els.claimAirdrop, true, "Claiming...", "Airdrop Claimed");
+      setStatus("Minting first-login EVFI airdrop...");
+      const response = await fetch(`/api/vehicle/${vehicleId}/claim-airdrop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-admin-key": adminKey,
+        },
+        body: JSON.stringify({ wallet: recipientWallet }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        const details = payload?.error || {};
+        throw new Error(details.message || payload.error || "Airdrop claim failed");
+      }
+
+      if (payload.txHash) {
+        setTxExplorer(payload.txHash);
+      }
+      els.claimAirdrop.textContent = "Airdrop Claimed";
+      setStatus(`Airdrop Claimed: ${formatNumber(payload.amountTokens)} EVFI`);
+      setHint(payload.txHash ? `Airdrop mint confirmed on Sepolia: ${payload.txHash}` : "Airdrop already claimed.");
+      showToast("Airdrop Claimed.", "success");
+      await refreshChainData();
+    } catch (error) {
+      setStatus(error.message || "Airdrop claim failed.", true);
+      showToast("Airdrop claim failed.", "error");
+      setActionButtonState(els.claimAirdrop, false, "Claiming...", "Airdrop Available");
+    }
+  }
+
+  function updateSportCountdown(endTime) {
+    if (!els.sportMode || !els.sportModeStatus || !endTime) {
+      return;
+    }
+
+    const tick = () => {
+      const seconds = Math.max(0, Math.floor(endTime - Date.now() / 1000));
+      if (seconds <= 0) {
+        els.sportMode.classList.remove("sport-active");
+        els.sportMode.dataset.active = "false";
+        els.sportModeStatus.textContent = "Sport Mode available: 15 minutes, 1 use per day.";
+        return;
+      }
+      const minutes = Math.floor(seconds / 60);
+      const remainder = seconds % 60;
+      els.sportModeStatus.textContent = `SPORT MODE ACTIVE - ${minutes}:${String(remainder).padStart(2, "0")} remaining`;
+      window.setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  function updateMockTokenMetrics() {
+    const priceEl = document.getElementById("mockEvfiPrice");
+    const capEl = document.getElementById("mockMarketCap");
+    const supplyEl = document.getElementById("mockCirculatingSupply");
+    const chartEl = document.getElementById("mockPriceChart");
+    if (!priceEl || !capEl || !supplyEl) {
+      return;
+    }
+
+    const supply = 100000000;
+    const drift = Math.sin(Date.now() / 45000) * 0.004;
+    const price = 0.04 + drift;
+    priceEl.textContent = `$${formatNumber(price)}`;
+    capEl.textContent = `$${formatNumber(price * supply)}`;
+    supplyEl.textContent = formatNumber(supply);
+    if (chartEl) {
+      chartEl.style.filter = `hue-rotate(${Math.round(drift * 4000)}deg)`;
+    }
+  }
+
+  async function activateSportMode() {
+    const vehicleId = els.sportMode?.dataset.vehicleId;
+    const recipientWallet = getRecipientWallet();
+    if (!vehicleId) {
+      setStatus("Vehicle context is missing for Sport Mode.", true);
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/vehicle/${vehicleId}/sport-mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet: recipientWallet }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "Sport Mode failed.");
+      }
+      els.sportMode.classList.add("sport-active");
+      els.sportMode.dataset.active = "true";
+      els.sportMode.dataset.endTime = payload.endTime;
+      updateSportCountdown(payload.endTime);
+      setStatus("SPORT MODE ACTIVE");
+      setHint("Negative scoring signals are ignored while Sport Mode is active. Positive rewards still count.");
+      showToast("SPORT MODE ACTIVE.", "success");
+    } catch (error) {
+      setStatus(error.message || "Sport Mode failed.", true);
+      showToast("Sport Mode unavailable.", "error");
+    }
+  }
+
   els.connect.addEventListener("click", connectWallet);
   if (els.disconnect) {
     els.disconnect.addEventListener("click", disconnectWallet);
@@ -474,8 +605,19 @@
   if (els.refreshAndDistribute) {
     els.refreshAndDistribute.addEventListener("click", refreshAndDistribute);
   }
+  if (els.claimAirdrop) {
+    els.claimAirdrop.addEventListener("click", claimAirdrop);
+  }
+  if (els.sportMode) {
+    els.sportMode.addEventListener("click", activateSportMode);
+    if (els.sportMode.dataset.active === "true") {
+      updateSportCountdown(Number(els.sportMode.dataset.endTime));
+    }
+  }
 
   resetWalletView();
+  updateMockTokenMetrics();
+  window.setInterval(updateMockTokenMetrics, 5000);
 
   if (!cfg.tokenAddress || !cfg.rewardsAddress) {
     setHint("Sepolia contracts not connected yet. Deploy EVFI contracts and add their addresses to the app config.");

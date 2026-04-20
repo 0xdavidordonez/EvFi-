@@ -2,6 +2,7 @@
   "name": "evfi-phase1-prototype",
   "version": "1.0.0",
   "description": "EvFi unified repo with Sepolia contracts and Tesla telemetry app",
+  "type": "module",
   "main": "evfi_assign_rewards.mjs",
   "scripts": {
     "clean": "hardhat clean",

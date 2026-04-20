@@ -35,11 +35,21 @@ describe("EvFi phase 1 contracts", function () {
     };
   }
 
-  it("mints the fixed cap to treasury at deployment", async function () {
+  it("mints initial circulating supply to treasury and preserves the fixed cap", async function () {
     const { token, treasury, maxSupply } = await loadFixture(deployFixture);
+    const initialTreasuryMint = maxSupply / 10n;
 
-    expect(await token.totalSupply()).to.equal(maxSupply);
-    expect(await token.balanceOf(treasury.address)).to.equal(maxSupply - ethers.parseUnits("250000", 18));
+    expect(await token.totalSupply()).to.equal(initialTreasuryMint);
+    expect(await token.balanceOf(treasury.address)).to.equal(initialTreasuryMint - ethers.parseUnits("250000", 18));
+  });
+
+  it("allows authorized airdrop minting up to the cap", async function () {
+    const { token, admin, userOne } = await loadFixture(deployFixture);
+    const amount = ethers.parseUnits("123", 18);
+
+    await token.connect(admin).mint(userOne.address, amount);
+
+    expect(await token.balanceOf(userOne.address)).to.equal(amount);
   });
 
   it("assigns and claims rewards from a funded pool", async function () {
@@ -57,6 +67,7 @@ describe("EvFi phase 1 contracts", function () {
       .withArgs(userOne.address, rewardAmount);
 
     expect(await rewards.pendingRewards(userOne.address)).to.equal(0n);
+    expect(await rewards.totalClaimed(userOne.address)).to.equal(rewardAmount);
     expect(await token.balanceOf(userOne.address)).to.equal(rewardAmount);
   });
 
@@ -73,11 +84,20 @@ describe("EvFi phase 1 contracts", function () {
       ),
     )
       .to.emit(rewards, "RewardsBatchAssigned")
-      .withArgs("2026-W15", 2n, rewardOne + rewardTwo);
+      .withArgs("2026-W15", 1n, 2n, rewardOne + rewardTwo);
 
     expect(await rewards.pendingRewards(userOne.address)).to.equal(rewardOne);
     expect(await rewards.pendingRewards(userTwo.address)).to.equal(rewardTwo);
     expect(await rewards.totalPendingRewards()).to.equal(rewardOne + rewardTwo);
+    expect(await rewards.currentWeek()).to.equal(2n);
+  });
+
+  it("blocks batch assignments that exceed the weekly pool", async function () {
+    const { rewards, userOne, weeklyRewardPool } = await loadFixture(deployFixture);
+
+    await expect(
+      rewards.assignRewardsBatch([userOne.address], [weeklyRewardPool + 1n], "too-large"),
+    ).to.be.revertedWithCustomError(rewards, "EvFiRewards__WeeklyPoolExceeded");
   });
 
   it("blocks assignments that exceed funded rewards balance", async function () {

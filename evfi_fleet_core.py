@@ -7,6 +7,7 @@ import time
 import sqlite3
 import os
 import subprocess
+from datetime import datetime, timedelta
 from html import escape
 
 app = Flask(__name__)
@@ -49,9 +50,18 @@ SEPOLIA_RPC_URL = os.getenv("SEPOLIA_RPC_URL", "")
 EVFI_TOKEN_ADDRESS = os.getenv("EVFI_TOKEN_ADDRESS", "")
 EVFI_REWARDS_ADDRESS = os.getenv("EVFI_REWARDS_ADDRESS", "")
 WEEKLY_REWARD_POOL = os.getenv("WEEKLY_REWARD_POOL", "10000")
+MAX_WEEKLY_EVFI = float(os.getenv("MAX_WEEKLY_EVFI", "1000"))
 EVFI_ASSIGN_SCRIPT = os.getenv("EVFI_ASSIGN_SCRIPT", "evfi_assign_rewards.mjs")
 EVFI_ASSIGN_RATE = float(os.getenv("EVFI_ASSIGN_RATE", "0.25"))
 EVFI_MIN_ASSIGNMENT = float(os.getenv("EVFI_MIN_ASSIGNMENT", "5"))
+
+MINIMUM_TRIP_DISTANCE = 2.0
+MINIMUM_TRIP_DURATION_SECONDS = 5 * 60
+MINIMUM_AVERAGE_SPEED = 12.0
+MAX_DAILY_MILES = 300.0
+SPORT_MODE_DURATION_SECONDS = 15 * 60
+SPORT_MODE_USES_PER_DAY = 1
+SPORT_MODE_COOLDOWN_SECONDS = 24 * 60 * 60
 
 STATE = secrets.token_urlsafe(32)
 LEGACY_DB_PATH = "drivetoken.db"
@@ -71,6 +81,37 @@ def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def now_ts():
+    return int(time.time())
+
+
+def current_week_bounds(ts=None):
+    current = datetime.fromtimestamp(ts or now_ts())
+    week_start_dt = current - timedelta(days=current.weekday())
+    week_start_dt = week_start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end_dt = week_start_dt + timedelta(days=7) - timedelta(seconds=1)
+    return int(week_start_dt.timestamp()), int(week_end_dt.timestamp())
+
+
+def fmt2(value):
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def fmt_ts(value):
+    return time.strftime("%b %d, %Y %I:%M %p", time.localtime(int(value))) if value else "Never"
+
+
+def log_v2_event(event_name, **payload):
+    app.logger.info("[evfi-v2] %s %s", event_name, json.dumps(payload, sort_keys=True, default=str))
+
+
+def log_rule_violation(rule_name, **payload):
+    app.logger.warning("[evfi-v2-rule] %s %s", rule_name, json.dumps(payload, sort_keys=True, default=str))
 
 
 def init_db():
@@ -98,6 +139,72 @@ def init_db():
         miles_added REAL,
         drv_earned REAL,
         synced_at INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_address TEXT UNIQUE,
+        created_at INTEGER,
+        sport_mode_active INTEGER DEFAULT 0,
+        sport_mode_start_time INTEGER,
+        sport_mode_end_time INTEGER,
+        sport_mode_uses_today INTEGER DEFAULT 0,
+        sport_mode_last_used INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS vehicles (
+        vin TEXT PRIMARY KEY,
+        user_id INTEGER,
+        odometer_last REAL,
+        created_at INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS weekly_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        vin TEXT,
+        week_start INTEGER,
+        week_end INTEGER,
+        verified_miles REAL,
+        active_days INTEGER,
+        charge_health_score REAL,
+        streak_multiplier REAL,
+        mission_bonus REAL,
+        total_score REAL,
+        created_at INTEGER,
+        UNIQUE(user_id, vin, week_start)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS missions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        mission_type TEXT,
+        progress REAL DEFAULT 0,
+        completed INTEGER DEFAULT 0,
+        completed_at INTEGER,
+        UNIQUE(user_id, mission_type)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        week_start INTEGER,
+        week_end INTEGER,
+        score REAL,
+        evfi_allocated REAL,
+        claimed INTEGER DEFAULT 0,
+        claimed_at INTEGER,
+        UNIQUE(user_id, week_start, week_end)
     )
     """)
 
@@ -1040,6 +1147,81 @@ BASE_CSS = """
         font-weight:700;
     }
 
+    .v2-score-grid{
+        margin-top:22px;
+    }
+
+    .mission-list{
+        margin-top:14px;
+        display:grid;
+        gap:10px;
+    }
+
+    .mission-row{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+        padding:12px 14px;
+        border-radius:16px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
+    .mission-pill{
+        border-radius:999px;
+        padding:6px 10px;
+        color:#dfe7f6;
+        background:rgba(105,167,255,.12);
+        border:1px solid rgba(105,167,255,.2);
+        font-size:12px;
+        white-space:nowrap;
+    }
+
+    .token-metrics-panel{
+        margin-top:24px;
+        padding-top:20px;
+        border-top:1px solid rgba(255,255,255,.08);
+    }
+
+    .token-metrics-grid{
+        display:grid;
+        grid-template-columns:repeat(2, minmax(0,1fr));
+        gap:10px;
+        margin-top:14px;
+    }
+
+    .token-metrics-grid div{
+        padding:12px;
+        border-radius:14px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
+    .token-metrics-grid span{
+        display:block;
+        color:var(--muted);
+        font-size:12px;
+        margin-bottom:6px;
+    }
+
+    .token-metrics-grid strong{
+        font-family:'Oxanium', sans-serif;
+        font-size:18px;
+    }
+
+    .mock-chart{
+        height:72px;
+        margin-top:14px;
+        border-radius:18px;
+        background:
+            linear-gradient(135deg, transparent 8%, rgba(32,227,124,.22) 9%, transparent 10%),
+            linear-gradient(160deg, transparent 28%, rgba(105,167,255,.28) 29%, transparent 30%),
+            linear-gradient(175deg, transparent 52%, rgba(255,45,70,.24) 53%, transparent 54%),
+            rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
     .stat-card{
         padding:22px 22px 20px;
         position:relative;
@@ -1263,6 +1445,12 @@ BASE_CSS = """
 
     .quick-btn:hover{
         background:rgba(255,255,255,.05);
+    }
+
+    .quick-btn.sport-active{
+        color:#08100b;
+        background:linear-gradient(135deg, #20e37c, #b8ffca);
+        border-color:rgba(32,227,124,.7);
     }
 
     .charge-card{
@@ -1594,6 +1782,396 @@ def normalize_assignment_exception(exc):
     }
 
 
+def get_or_create_user(wallet_address=None):
+    wallet = wallet_address if is_valid_evm_address(wallet_address or "") else DEFAULT_WALLET_ADDRESS
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE wallet_address = ?", (wallet,))
+    user = cur.fetchone()
+    if user is None:
+        cur.execute(
+            """
+            INSERT INTO users
+            (wallet_address, created_at, sport_mode_active, sport_mode_uses_today)
+            VALUES (?, ?, 0, 0)
+            """,
+            (wallet, now_ts()),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE wallet_address = ?", (wallet,))
+        user = cur.fetchone()
+        log_v2_event("user_created", wallet=wallet)
+    conn.close()
+    return user
+
+
+def expire_sport_mode(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cur.fetchone()
+    if user and user["sport_mode_active"] and user["sport_mode_end_time"] and now_ts() >= user["sport_mode_end_time"]:
+        cur.execute("UPDATE users SET sport_mode_active = 0 WHERE id = ?", (user_id,))
+        conn.commit()
+        log_v2_event("sport_mode_expired", user_id=user_id)
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    updated = cur.fetchone()
+    conn.close()
+    return updated
+
+
+def bind_vehicle_to_user(vin, user_id, odometer):
+    if not vin or vin == "Unknown VIN":
+        return True
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM vehicles WHERE vin = ?", (vin,))
+    existing = cur.fetchone()
+    if existing and int(existing["user_id"]) != int(user_id):
+        log_rule_violation("vin_wallet_conflict", vin=vin, existing_user=existing["user_id"], requested_user=user_id)
+        conn.close()
+        return False
+
+    if existing is None:
+        cur.execute(
+            "INSERT INTO vehicles (vin, user_id, odometer_last, created_at) VALUES (?, ?, ?, ?)",
+            (vin, user_id, odometer, now_ts()),
+        )
+        log_v2_event("vehicle_bound", vin=vin, user_id=user_id)
+    else:
+        cur.execute("UPDATE vehicles SET odometer_last = ? WHERE vin = ?", (odometer, vin))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_daily_verified_miles(user_id, event_vehicle_id, day_start):
+    day_end = day_start + 86400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(miles_added), 0) AS miles
+        FROM reward_events
+        WHERE tesla_vehicle_id = ?
+          AND synced_at >= ?
+          AND synced_at < ?
+          AND miles_added >= ?
+        """,
+        (event_vehicle_id, day_start, day_end, MINIMUM_TRIP_DISTANCE),
+    )
+    miles = float(cur.fetchone()["miles"] or 0)
+    conn.close()
+    return miles
+
+
+def validate_trip_for_scoring(user_id, event_vehicle_id, miles_added, previous_synced_at, synced_at):
+    if miles_added <= 0:
+        return 0.0
+    if miles_added < MINIMUM_TRIP_DISTANCE:
+        log_rule_violation("minimum_trip_distance", user_id=user_id, vehicle_id=event_vehicle_id, miles=miles_added)
+        return 0.0
+
+    duration = synced_at - previous_synced_at if previous_synced_at else MINIMUM_TRIP_DURATION_SECONDS
+    if duration < MINIMUM_TRIP_DURATION_SECONDS:
+        log_rule_violation("minimum_trip_duration", user_id=user_id, vehicle_id=event_vehicle_id, duration=duration)
+        return 0.0
+
+    average_speed = miles_added / max(duration / 3600, 0.01)
+    if average_speed < MINIMUM_AVERAGE_SPEED:
+        log_rule_violation("minimum_average_speed", user_id=user_id, vehicle_id=event_vehicle_id, average_speed=average_speed)
+        return 0.0
+
+    day_start = current_week_bounds(synced_at)[0] + ((datetime.fromtimestamp(synced_at).weekday()) * 86400)
+    counted_today = get_daily_verified_miles(user_id, event_vehicle_id, day_start)
+    remaining = max(0.0, MAX_DAILY_MILES - counted_today)
+    if miles_added > remaining:
+        log_rule_violation("max_daily_miles", user_id=user_id, vehicle_id=event_vehicle_id, miles=miles_added, remaining=remaining)
+    return min(miles_added, remaining)
+
+
+def get_week_verified_miles(event_vehicle_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(miles_added), 0) AS miles
+        FROM reward_events
+        WHERE tesla_vehicle_id = ?
+          AND synced_at BETWEEN ? AND ?
+          AND miles_added >= ?
+        """,
+        (event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
+    )
+    miles = float(cur.fetchone()["miles"] or 0)
+    conn.close()
+    return miles
+
+
+def mission_points(mission_type):
+    return {
+        "sync_vehicle": 25,
+        "drive_once_today": 50,
+        "efficient_trip": 75,
+        "drive_on_5_days": 200,
+        "complete_3_healthy_charges": 150,
+        "stay_active_all_week": 150,
+    }.get(mission_type, 0)
+
+
+def upsert_mission(user_id, mission_type, progress, completed):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    completed_at = now_ts() if completed else None
+    cur.execute(
+        """
+        INSERT INTO missions (user_id, mission_type, progress, completed, completed_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, mission_type) DO UPDATE SET
+            progress = excluded.progress,
+            completed = CASE WHEN missions.completed = 1 THEN 1 ELSE excluded.completed END,
+            completed_at = CASE
+                WHEN missions.completed = 1 THEN missions.completed_at
+                WHEN excluded.completed = 1 THEN excluded.completed_at
+                ELSE missions.completed_at
+            END
+        """,
+        (user_id, mission_type, progress, 1 if completed else 0, completed_at),
+    )
+    conn.commit()
+    if completed:
+        log_v2_event("mission_completion", user_id=user_id, mission_type=mission_type, progress=progress)
+    conn.close()
+
+
+def get_completed_mission_bonus(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT mission_type FROM missions WHERE user_id = ? AND completed = 1", (user_id,))
+    bonus = sum(mission_points(row["mission_type"]) for row in cur.fetchall())
+    conn.close()
+    return float(bonus)
+
+
+def calculate_active_days(user_id, event_vehicle_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT synced_at, miles_added
+        FROM reward_events
+        WHERE tesla_vehicle_id = ?
+          AND synced_at BETWEEN ? AND ?
+          AND miles_added >= ?
+        """,
+        (event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
+    )
+    days = {time.strftime("%Y-%m-%d", time.localtime(row["synced_at"])) for row in cur.fetchall()}
+    conn.close()
+    return len(days)
+
+
+def calculate_streak_multiplier(active_days):
+    if active_days >= 30:
+        return 1.25
+    if active_days >= 14:
+        return 1.15
+    if active_days >= 7:
+        return 1.10
+    if active_days >= 3:
+        return 1.05
+    return 1.0
+
+
+def update_missions(user_id, verified_miles, active_days, charge_health_score):
+    upsert_mission(user_id, "sync_vehicle", 1, True)
+    upsert_mission(user_id, "drive_once_today", 1 if verified_miles >= MINIMUM_TRIP_DISTANCE else 0, verified_miles >= MINIMUM_TRIP_DISTANCE)
+    upsert_mission(user_id, "efficient_trip", 1 if charge_health_score >= 100 else 0, charge_health_score >= 100)
+    upsert_mission(user_id, "drive_on_5_days", active_days, active_days >= 5)
+    upsert_mission(user_id, "complete_3_healthy_charges", 1 if charge_health_score >= 100 else 0, False)
+    upsert_mission(user_id, "stay_active_all_week", active_days, active_days >= 7)
+
+
+def calculate_weekly_score(user_id, vin, event_vehicle_id, charge_health_score=100.0):
+    week_start, week_end = current_week_bounds()
+    verified_miles = get_week_verified_miles(event_vehicle_id, week_start, week_end)
+    active_days = calculate_active_days(user_id, event_vehicle_id, week_start, week_end)
+    streak_multiplier = calculate_streak_multiplier(active_days)
+    update_missions(user_id, verified_miles, active_days, charge_health_score)
+    mission_bonus = get_completed_mission_bonus(user_id)
+    base_score = float(verified_miles) + float(active_days * 25) + float(charge_health_score)
+    total_score = round((base_score * streak_multiplier) + mission_bonus, 2)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO weekly_scores
+        (user_id, vin, week_start, week_end, verified_miles, active_days, charge_health_score, streak_multiplier, mission_bonus, total_score, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, vin, week_start) DO UPDATE SET
+            week_end = excluded.week_end,
+            verified_miles = excluded.verified_miles,
+            active_days = excluded.active_days,
+            charge_health_score = excluded.charge_health_score,
+            streak_multiplier = excluded.streak_multiplier,
+            mission_bonus = excluded.mission_bonus,
+            total_score = excluded.total_score,
+            created_at = excluded.created_at
+        """,
+        (
+            user_id,
+            vin,
+            week_start,
+            week_end,
+            verified_miles,
+            active_days,
+            charge_health_score,
+            streak_multiplier,
+            mission_bonus,
+            total_score,
+            now_ts(),
+        ),
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT * FROM weekly_scores WHERE user_id = ? AND vin = ? AND week_start = ?",
+        (user_id, vin, week_start),
+    )
+    row = cur.fetchone()
+    conn.close()
+    log_v2_event("score_calculation", user_id=user_id, vin=vin, week_start=week_start, total_score=total_score)
+    return row
+
+
+def get_current_week_score(user_id, vin):
+    week_start, _ = current_week_bounds()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM weekly_scores WHERE user_id = ? AND vin = ? AND week_start = ?",
+        (user_id, vin, week_start),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def distribute_weekly_pool(user_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(total_score), 0) AS total_score FROM weekly_scores WHERE week_start = ? AND week_end = ?",
+        (week_start, week_end),
+    )
+    total_score = float(cur.fetchone()["total_score"] or 0)
+    cur.execute(
+        "SELECT COALESCE(SUM(total_score), 0) AS score FROM weekly_scores WHERE user_id = ? AND week_start = ? AND week_end = ?",
+        (user_id, week_start, week_end),
+    )
+    user_score = float(cur.fetchone()["score"] or 0)
+    weekly_pool = float(WEEKLY_REWARD_POOL)
+    allocated = 0.0 if total_score <= 0 else weekly_pool * (user_score / total_score)
+    allocated = round(min(allocated, MAX_WEEKLY_EVFI), 2)
+    cur.execute(
+        """
+        INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at)
+        VALUES (?, ?, ?, ?, ?, 0, NULL)
+        ON CONFLICT(user_id, week_start, week_end) DO UPDATE SET
+            score = excluded.score,
+            evfi_allocated = excluded.evfi_allocated
+        """,
+        (user_id, week_start, week_end, user_score, allocated),
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT * FROM claims WHERE user_id = ? AND week_start = ? AND week_end = ?",
+        (user_id, week_start, week_end),
+    )
+    claim = cur.fetchone()
+    conn.close()
+    log_v2_event("distribution", user_id=user_id, week_start=week_start, score=user_score, evfi_allocated=allocated)
+    return claim
+
+
+def get_last_distribution(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM claims WHERE user_id = ? ORDER BY week_start DESC, id DESC LIMIT 1", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_missions(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM missions WHERE user_id = ? ORDER BY completed ASC, mission_type ASC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def ensure_airdrop_claim(user_id, total_miles):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
+    claim = cur.fetchone()
+    if claim is None:
+        cur.execute(
+            """
+            INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at)
+            VALUES (?, 0, 0, ?, ?, 0, NULL)
+            """,
+            (user_id, total_miles, round(float(total_miles), 2)),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
+        claim = cur.fetchone()
+        log_v2_event("airdrop_available", user_id=user_id, amount=total_miles)
+    conn.close()
+    return claim
+
+
+def get_airdrop_claim(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
+    claim = cur.fetchone()
+    conn.close()
+    return claim
+
+
+def driver_coach_agent():
+    pass
+
+
+def reward_optimizer_agent():
+    pass
+
+
+def battery_health_agent():
+    pass
+
+
+def fraud_detection_agent():
+    pass
+
+
+def weekly_distribution_trigger():
+    pass
+
+
+def price_feed_source():
+    pass
+
+
+def random_reward_source():
+    pass
+
+
 def assign_demo_reward_onchain(wallet_address, amount_tokens, batch_id):
     if not is_valid_evm_address(wallet_address):
         raise ValueError("A valid wallet address is required")
@@ -1641,6 +2219,57 @@ def assign_demo_reward_onchain(wallet_address, amount_tokens, batch_id):
         if parsed_error:
             raise RuntimeError(json.dumps(parsed_error))
         raise RuntimeError("Reward assignment failed")
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"ok": True, "output": stdout}
+
+
+def mint_airdrop_onchain(wallet_address, amount_tokens, batch_id):
+    if not is_valid_evm_address(wallet_address):
+        raise ValueError("A valid wallet address is required")
+    if not EVFI_TOKEN_ADDRESS:
+        raise ValueError("EVFI token address is not configured")
+
+    command = [
+        "cmd",
+        "/c",
+        "node",
+        EVFI_ASSIGN_SCRIPT,
+        "--mode",
+        "mint-airdrop",
+        "--wallet",
+        wallet_address,
+        "--amount",
+        str(amount_tokens),
+        "--batch-id",
+        batch_id,
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=os.environ.copy(),
+    )
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+
+    if completed.returncode != 0:
+        parsed_error = None
+        raw = stderr or stdout
+        if raw:
+            try:
+                parsed_error = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed_error = {"ok": False, "error": {"message": raw}}
+        if parsed_error:
+            raise RuntimeError(json.dumps(parsed_error))
+        raise RuntimeError("Airdrop mint failed")
 
     try:
         return json.loads(stdout)
@@ -1799,6 +2428,10 @@ def get_reward_summary_for_vehicle(vid, display_name, vin, current_odometer):
 
 
 def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
+    user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
+    user = expire_sport_mode(user["id"])
+    bind_vehicle_to_user(vin, user["id"], current_odometer)
+
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -1837,13 +2470,16 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
             0,
             now_ts
         ))
+        verified_miles = 0.0
     else:
         previous_latest = float(existing["latest_odometer"] or 0)
         baseline = float(existing["baseline_odometer"] or current_odometer)
+        previous_synced_at = int(existing["last_synced_at"] or now_ts)
 
         miles_added = current_odometer - previous_latest
         if miles_added < 0:
             miles_added = 0
+        verified_miles = validate_trip_for_scoring(user["id"], str(vid), miles_added, previous_synced_at, now_ts)
 
         total_miles = current_odometer - baseline
         if total_miles < 0:
@@ -1877,8 +2513,8 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
         """, (
             str(vid),
             current_odometer,
-            miles_added,
-            miles_added,
+            verified_miles,
+            verified_miles,
             now_ts
         ))
 
@@ -1890,6 +2526,8 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
     )
     row = cur.fetchone()
     conn.close()
+    calculate_weekly_score(user["id"], vin, str(vid))
+    ensure_airdrop_claim(user["id"], current_odometer)
     return row
 
 
@@ -2096,6 +2734,13 @@ def dashboard(vid):
 
     summary = get_reward_summary_for_vehicle(vid, display_name, vin, current_odometer)
     events = get_recent_reward_events(vid)
+    user = expire_sport_mode(get_or_create_user(DEFAULT_WALLET_ADDRESS)["id"])
+    weekly_score = get_current_week_score(user["id"], vin) or calculate_weekly_score(user["id"], vin, str(vid))
+    missions = get_user_missions(user["id"])
+    last_distribution = get_last_distribution(user["id"])
+    airdrop_claim = ensure_airdrop_claim(user["id"], current_odometer)
+    sport_active = bool(user["sport_mode_active"])
+    sport_countdown = max(0, int(user["sport_mode_end_time"] or 0) - now_ts()) if sport_active else 0
 
     if time_to_full_charge is not None:
         total_minutes = int(float(time_to_full_charge) * 60)
@@ -2139,13 +2784,13 @@ def dashboard(vid):
 
     events_rows = ""
     for e in events:
-        synced_at_str = time.strftime("%b %d, %Y %I:%M %p", time.localtime(e["synced_at"]))
+        synced_at_str = fmt_ts(e["synced_at"])
         events_rows += f"""
         <tr>
             <td>{escape(synced_at_str)}</td>
-            <td>{e["odometer_reading"]}</td>
-            <td>{e["miles_added"]}</td>
-            <td class="gain">+{e["drv_earned"]}</td>
+            <td>{fmt2(e["odometer_reading"])}</td>
+            <td>{fmt2(e["miles_added"])}</td>
+            <td class="gain">+{fmt2(e["drv_earned"])}</td>
         </tr>
         """
 
@@ -2157,7 +2802,25 @@ def dashboard(vid):
         """
 
     last_synced = summary["last_synced_at"]
-    last_synced_str = time.strftime("%b %d, %Y %I:%M %p", time.localtime(last_synced)) if last_synced else "Never"
+    last_synced_str = fmt_ts(last_synced)
+    score_updated_str = fmt_ts(weekly_score["created_at"] if weekly_score else None)
+    distribution_updated_str = fmt_ts(last_distribution["claimed_at"] if last_distribution and last_distribution["claimed_at"] else (last_distribution["week_end"] if last_distribution else None))
+    last_distribution_value = fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)
+    airdrop_status = "Airdrop Claimed" if airdrop_claim and airdrop_claim["claimed"] else "Airdrop Available"
+    airdrop_amount = fmt2(airdrop_claim["evfi_allocated"] if airdrop_claim else current_odometer)
+    mission_rows = ""
+    for mission in missions:
+        mission_rows += f"""
+        <div class="mission-row">
+            <div>
+                <strong>{escape(str(mission["mission_type"]).replace("_", " ").title())}</strong>
+                <div class="sub">Progress: {fmt2(mission["progress"])}</div>
+            </div>
+            <span class="mission-pill">{'Complete' if mission["completed"] else 'Active'}</span>
+        </div>
+        """
+    if not mission_rows:
+        mission_rows = "<div class='sub'>Sync the vehicle to start missions.</div>"
 
     body = f"""
     <section class="topbar">
@@ -2188,9 +2851,12 @@ def dashboard(vid):
                 <button id="refreshAndDistributeButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{build_demo_assignment_amount(summary)}">Sync + Airdrop</button>
                 <button class="quick-btn" onclick="window.location.href='/vehicle/{vid}/raw'">Raw Data</button>
                 <button id="claimRewardsButton" class="quick-btn">Claim EVFI</button>
+                <button id="claimAirdropButton" class="quick-btn" data-vehicle-id="{vid}" data-airdrop-amount="{airdrop_amount}">{escape(airdrop_status)}</button>
+                <button id="sportModeButton" class="quick-btn {'sport-active' if sport_active else ''}" data-vehicle-id="{vid}" data-active="{'true' if sport_active else 'false'}" data-end-time="{int(user['sport_mode_end_time'] or 0)}">SPORT MODE</button>
                 <button id="assignRewardsButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{build_demo_assignment_amount(summary)}">Assign Test EVFI</button>
                 <button class="quick-btn" onclick="alert('Vehicle controls can be wired next')">Controls</button>
             </div>
+            <div id="sportModeStatus" class="sub">{'SPORT MODE ACTIVE - ' + str(sport_countdown) + 's remaining' if sport_active else 'Sport Mode available: 15 minutes, 1 use per day.'}</div>
             <div class="admin-stack">
                 <input id="distributionRecipientInput" class="admin-input" type="text" value="{escape(DEFAULT_WALLET_ADDRESS)}" placeholder="Distribution recipient wallet 0x...">
                 <input id="adminKeyInput" class="admin-input" type="password" placeholder="Admin API key">
@@ -2273,6 +2939,47 @@ def dashboard(vid):
 
             <div id="walletConnectHint" class="wallet-hint">Sepolia contracts are connected. Link your wallet to unlock live EVFI balance reads and claim flow.</div>
             <div id="walletToast" class="inline-toast" data-tone="success"></div>
+
+            <div class="token-metrics-panel">
+                <div class="label">EvFi Token Metrics</div>
+                <div class="token-metrics-grid">
+                    <div><span>Mock Price</span><strong id="mockEvfiPrice">$0.04</strong></div>
+                    <div><span>Market Cap</span><strong id="mockMarketCap">$4,000,000.00</strong></div>
+                    <div><span>Circulating</span><strong id="mockCirculatingSupply">100,000,000.00</strong></div>
+                    <div><span>Max Supply</span><strong>1,000,000,000.00</strong></div>
+                </div>
+                <div class="mock-chart" id="mockPriceChart" aria-label="Mock EVFI price chart"></div>
+            </div>
+        </section>
+    </section>
+
+    <section class="stats-grid v2-score-grid">
+        <section class="panel secondary-card">
+            <div class="label">Weekly Score</div>
+            <h3 class="secondary-card-title">{fmt2(weekly_score["total_score"] if weekly_score else 0)} pts</h3>
+            <p class="secondary-card-copy">Verified miles, active days, charge health, streak multiplier, and mission bonuses.</p>
+            <div class="sub">Updated {escape(score_updated_str)}</div>
+        </section>
+
+        <section class="panel secondary-card">
+            <div class="label">Active Streak</div>
+            <h3 class="secondary-card-title">{weekly_score["active_days"] if weekly_score else 0} active days</h3>
+            <p class="secondary-card-copy">Multiplier: {fmt2(weekly_score["streak_multiplier"] if weekly_score else 1.0)}x</p>
+            <div class="sub">Updated {escape(score_updated_str)}</div>
+        </section>
+
+        <section class="panel secondary-card">
+            <div class="label">Active Missions</div>
+            <h3 class="secondary-card-title">{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)} bonus pts</h3>
+            <div class="mission-list">{mission_rows}</div>
+            <div class="sub">Updated {escape(score_updated_str)}</div>
+        </section>
+
+        <section class="panel secondary-card">
+            <div class="label">Last Distribution</div>
+            <h3 class="secondary-card-title">{last_distribution_value} EVFI</h3>
+            <p class="secondary-card-copy">Fixed-pool deterministic allocation with weekly caps.</p>
+            <div class="sub">Updated {escape(distribution_updated_str)}</div>
         </section>
     </section>
 
@@ -2472,8 +3179,14 @@ def refresh_and_distribute_reward(vid):
     if not is_valid_evm_address(wallet):
         return jsonify({"error": "A valid recipient wallet is required"}), 400
 
-    amount_tokens = float(payload.get("amountTokens") or build_demo_assignment_amount(summary))
-    batch_id = str(payload.get("batchId") or build_distribution_batch_id(vid, "sync"))
+    user = get_or_create_user(wallet)
+    if not bind_vehicle_to_user(context["vin"], user["id"], context["odometer"]):
+        return jsonify({"error": "VIN is already bound to another wallet"}), 409
+
+    weekly_score = calculate_weekly_score(user["id"], context["vin"], str(vid))
+    claim = distribute_weekly_pool(user["id"], weekly_score["week_start"], weekly_score["week_end"])
+    amount_tokens = float(claim["evfi_allocated"] or 0)
+    batch_id = str(payload.get("batchId") or build_distribution_batch_id(vid, "weekly"))
 
     try:
         output = assign_demo_reward_onchain(wallet, amount_tokens, batch_id)
@@ -2489,11 +3202,104 @@ def refresh_and_distribute_reward(vid):
             "amountTokens": amount_tokens,
             "batchId": batch_id,
             "telemetryScore": float(summary["drv_balance"] or 0),
+            "weeklyScore": float(weekly_score["total_score"] or 0),
             "totalMiles": float(summary["total_miles"] or 0),
             "txHash": output.get("txHash"),
             "output": output,
         }
     )
+
+
+@app.route("/api/vehicle/<vid>/claim-airdrop", methods=["POST"])
+def claim_airdrop(vid):
+    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid recipient wallet is required"}), 400
+
+    try:
+        context = load_vehicle_and_summary(vid)
+    except ValueError:
+        return jsonify({"error": "Vehicle not found"}), 404
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    user = get_or_create_user(wallet)
+    if not bind_vehicle_to_user(context["vin"], user["id"], context["odometer"]):
+        return jsonify({"error": "VIN is already bound to another wallet"}), 409
+
+    claim = ensure_airdrop_claim(user["id"], context["odometer"])
+    if claim["claimed"]:
+        return jsonify({"ok": True, "message": "Airdrop Claimed", "claimed": True, "amountTokens": claim["evfi_allocated"]})
+
+    amount_tokens = round(float(claim["evfi_allocated"] or 0), 2)
+    batch_id = build_distribution_batch_id(vid, "airdrop")
+
+    try:
+        output = mint_airdrop_onchain(wallet, amount_tokens, batch_id)
+    except Exception as exc:
+        payload = normalize_assignment_exception(exc)
+        return jsonify(payload), 500
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE claims SET claimed = 1, claimed_at = ? WHERE id = ?", (now_ts(), claim["id"]))
+    conn.commit()
+    conn.close()
+    log_v2_event("airdrop_claim", user_id=user["id"], wallet=wallet, amount=amount_tokens, txHash=output.get("txHash"))
+
+    return jsonify(
+        {
+            "ok": True,
+            "claimed": True,
+            "message": "Airdrop Claimed",
+            "wallet": wallet,
+            "amountTokens": amount_tokens,
+            "batchId": batch_id,
+            "txHash": output.get("txHash"),
+            "output": output,
+        }
+    )
+
+
+@app.route("/api/vehicle/<vid>/sport-mode", methods=["POST"])
+def activate_sport_mode(vid):
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    user = get_or_create_user(wallet)
+    user = expire_sport_mode(user["id"])
+    current = now_ts()
+    last_used = int(user["sport_mode_last_used"] or 0)
+
+    if user["sport_mode_active"]:
+        return jsonify({"ok": True, "active": True, "endTime": user["sport_mode_end_time"]})
+
+    if user["sport_mode_uses_today"] >= SPORT_MODE_USES_PER_DAY and current - last_used < SPORT_MODE_COOLDOWN_SECONDS:
+        log_rule_violation("sport_mode_cooldown", user_id=user["id"], vehicle_id=vid)
+        return jsonify({"error": "Sport Mode cooldown is active. Try again tomorrow."}), 429
+
+    end_time = current + SPORT_MODE_DURATION_SECONDS
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE users
+        SET sport_mode_active = 1,
+            sport_mode_start_time = ?,
+            sport_mode_end_time = ?,
+            sport_mode_uses_today = ?,
+            sport_mode_last_used = ?
+        WHERE id = ?
+        """,
+        (current, end_time, int(user["sport_mode_uses_today"] or 0) + 1, current, user["id"]),
+    )
+    conn.commit()
+    conn.close()
+    log_v2_event("sport_mode_activation", user_id=user["id"], vehicle_id=vid, end_time=end_time)
+    return jsonify({"ok": True, "active": True, "startTime": current, "endTime": end_time})
 
 
 @app.route("/vehicle/<vid>/raw")

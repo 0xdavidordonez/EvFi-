@@ -14,18 +14,21 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
 
     IERC20 public immutable rewardToken;
     uint256 public weeklyRewardPool;
+    uint256 public currentWeek;
     uint256 public totalPendingRewards;
     mapping(address => uint256) public pendingRewards;
+    mapping(address => uint256) public totalClaimed;
 
     error EvFiRewards__InvalidAddress();
     error EvFiRewards__InvalidArrayLength();
     error EvFiRewards__InvalidAmount();
     error EvFiRewards__NoRewards();
     error EvFiRewards__InsufficientFunding(uint256 contractBalance, uint256 requiredBalance);
+    error EvFiRewards__WeeklyPoolExceeded(uint256 requested, uint256 weeklyPool);
 
     event WeeklyRewardPoolUpdated(uint256 previousPool, uint256 newPool);
     event RewardAssigned(address indexed account, uint256 amount, string reason, uint256 pendingTotal);
-    event RewardsBatchAssigned(string indexed batchId, uint256 recipients, uint256 totalAmount);
+    event RewardsBatchAssigned(string indexed batchId, uint256 indexed week, uint256 recipients, uint256 totalAmount);
     event RewardClaimed(address indexed account, uint256 amount);
     event UnallocatedTokensRescued(address indexed to, uint256 amount);
 
@@ -36,6 +39,7 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
 
         rewardToken = IERC20(tokenAddress);
         weeklyRewardPool = initialWeeklyRewardPool;
+        currentWeek = 1;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(REWARD_MANAGER_ROLE, admin);
@@ -67,6 +71,9 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
         }
 
         _ensureFunded(totalAmount);
+        if (totalAmount > weeklyRewardPool) {
+            revert EvFiRewards__WeeklyPoolExceeded(totalAmount, weeklyRewardPool);
+        }
 
         for (uint256 i = 0; i < accounts.length; i++) {
             pendingRewards[accounts[i]] += amounts[i];
@@ -74,7 +81,8 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
         }
 
         totalPendingRewards += totalAmount;
-        emit RewardsBatchAssigned(batchId, accounts.length, totalAmount);
+        emit RewardsBatchAssigned(batchId, currentWeek, accounts.length, totalAmount);
+        currentWeek += 1;
     }
 
     function claim() external nonReentrant whenNotPaused {
@@ -85,6 +93,7 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
 
         pendingRewards[msg.sender] = 0;
         totalPendingRewards -= amount;
+        totalClaimed[msg.sender] += amount;
         rewardToken.safeTransfer(msg.sender, amount);
 
         emit RewardClaimed(msg.sender, amount);
@@ -129,6 +138,9 @@ contract EvFiRewards is AccessControl, Pausable, ReentrancyGuard {
         }
         if (amount == 0) {
             revert EvFiRewards__InvalidAmount();
+        }
+        if (amount > weeklyRewardPool) {
+            revert EvFiRewards__WeeklyPoolExceeded(amount, weeklyRewardPool);
         }
 
         _ensureFunded(amount);

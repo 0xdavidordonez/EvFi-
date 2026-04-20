@@ -59,6 +59,7 @@ function serializeError(error) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const mode = args.mode || "assign-reward";
   const wallet = args.wallet;
   const amount = args.amount;
   const batchId = args["batch-id"] || `evfi-demo-${new Date().toISOString()}`;
@@ -76,8 +77,8 @@ async function main() {
   const rewardsAddress = process.env.EVFI_REWARDS_ADDRESS;
   const signerKey = process.env.REWARD_MANAGER_PRIVATE_KEY || process.env.DEPLOYER_PRIVATE_KEY;
 
-  if (!rpcUrl || !rewardsAddress || !tokenAddress || !signerKey) {
-    throw new Error("SEPOLIA_RPC_URL, EVFI_TOKEN_ADDRESS, EVFI_REWARDS_ADDRESS, and REWARD_MANAGER_PRIVATE_KEY or DEPLOYER_PRIVATE_KEY are required");
+  if (!rpcUrl || !tokenAddress || !signerKey || (mode !== "mint-airdrop" && !rewardsAddress)) {
+    throw new Error("SEPOLIA_RPC_URL, EVFI_TOKEN_ADDRESS, EVFI_REWARDS_ADDRESS for rewards mode, and REWARD_MANAGER_PRIVATE_KEY or DEPLOYER_PRIVATE_KEY are required");
   }
 
   logStep("Telemetry fetched");
@@ -97,13 +98,51 @@ async function main() {
 
   const [tokenCode, rewardsCode] = await Promise.all([
     provider.getCode(tokenAddress),
-    provider.getCode(rewardsAddress),
+    mode === "mint-airdrop" ? Promise.resolve("0x01") : provider.getCode(rewardsAddress),
   ]);
   if (tokenCode === "0x") {
     throw new Error("Token contract not deployed.");
   }
-  if (rewardsCode === "0x") {
+  if (mode !== "mint-airdrop" && rewardsCode === "0x") {
     throw new Error("Rewards contract not deployed.");
+  }
+
+  const tokenAmount = ethers.parseUnits(String(amount), 18);
+
+  if (mode === "mint-airdrop") {
+    const tokenAbi = [
+      "function MINTER_ROLE() view returns (bytes32)",
+      "function hasRole(bytes32 role, address account) view returns (bool)",
+      "function mint(address to, uint256 amount)",
+    ];
+    const token = new ethers.Contract(tokenAddress, tokenAbi, signer);
+    const minterRole = await token.MINTER_ROLE();
+    const isMinter = await token.hasRole(minterRole, signer.address);
+    if (!isMinter) {
+      throw new Error("Wallet is not authorized to mint EVFI airdrops.");
+    }
+    logStep("Minting first-login airdrop", { amount, wallet, batchId });
+    const tx = await token.mint(wallet, tokenAmount);
+    logStep("Transaction hash:", { hash: tx.hash });
+    const receipt = await tx.wait();
+    logStep("Transaction confirmed", { blockNumber: receipt.blockNumber, status: receipt.status });
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          mode,
+          wallet,
+          amount,
+          batchId,
+          txHash: tx.hash,
+          receipt,
+          logs,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
   }
 
   const rewardsAbi = [
@@ -120,7 +159,6 @@ async function main() {
     throw new Error("Wallet is not authorized to mint tokens.");
   }
 
-  const tokenAmount = ethers.parseUnits(String(amount), 18);
   const availableBalance = await rewards.availableRewardsBalance();
   if (availableBalance < tokenAmount) {
     throw new Error(`Rewards contract is underfunded. Available: ${ethers.formatUnits(availableBalance, 18)} EVFI.`);

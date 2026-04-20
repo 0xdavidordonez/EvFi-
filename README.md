@@ -158,4 +158,4 @@ If you are testing through ngrok, update both Tesla developer settings and `TESL
 
 ## Status
 
-This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase, new features and improvements will come in V2 and V3. contract adress: [contract adress]([https://sepolia.etherscan.io/address/0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F])
+This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase, new features and improvements will come in V2 and V3. contract adress: 0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F([https://sepolia.etherscan.io/address/0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F])

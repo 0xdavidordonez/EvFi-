@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Electrified achievement badge">
+  <defs>
+    <radialGradient id="core" cx="50%" cy="44%" r="58%">
+      <stop offset="0%" stop-color="#d8fff0"/>
+      <stop offset="34%" stop-color="#20e37c"/>
+      <stop offset="72%" stop-color="#0c7bff"/>
+      <stop offset="100%" stop-color="#071018"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="13%" y1="8%" x2="88%" y2="94%">
+      <stop offset="0%" stop-color="#fff6bf"/>
+      <stop offset="28%" stop-color="#70ffb4"/>
+      <stop offset="54%" stop-color="#5ea6ff"/>
+      <stop offset="78%" stop-color="#ff4c64"/>
+      <stop offset="100%" stop-color="#1b2334"/>
+    </linearGradient>
+    <filter id="glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.125 0 0 0 0 0.89 0 0 0 0 0.49 0 0 0 .72 0"/>
+      <feBlend in="SourceGraphic"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="#06070b"/>
+  <path d="M256 34 443 142v216L256 466 69 358V142Z" fill="url(#metal)" filter="url(#glow)"/>
+  <path d="M256 64 417 157v186L256 436 95 343V157Z" fill="#071018" opacity=".88"/>
+  <path d="M256 94 391 172v156L256 406 121 328V172Z" fill="url(#core)"/>
+  <path d="M256 132 342 182 256 232 170 182Z" fill="#f8fff9" opacity=".72"/>
+  <path d="M170 205 244 248v104l-74-43Z" fill="#10253c" opacity=".72"/>
+  <path d="M342 205 268 248v104l74-43Z" fill="#06131f" opacity=".78"/>
+  <path d="M256 164 315 198 256 232 197 198Z" fill="#20e37c"/>
+  <path d="M256 232 315 198v68l-59 34Z" fill="#5ea6ff"/>
+  <path d="M256 232 197 198v68l59 34Z" fill="#ff4c64"/>
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#ffffff" stroke-opacity=".22" stroke-width="6"/>
+  <circle cx="256" cy="256" r="126" fill="none" stroke="#d8fff0" stroke-opacity=".18" stroke-width="3" stroke-dasharray="16 18"/>
+  <path d="M256 54v44M256 414v44M78 256h44M390 256h44" stroke="#ffffff" stroke-opacity=".46" stroke-width="8" stroke-linecap="round"/>
+</svg>

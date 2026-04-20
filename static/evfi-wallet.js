@@ -458,6 +458,7 @@
       showToast("EVFI tokens successfully airdropped.", "success");
       console.log("Transaction confirmed");
       await refreshChainData();
+      updateMockTokenMetrics();
     } catch (error) {
       console.error(error);
       const details = stringifyExtraError(error);
@@ -557,8 +558,67 @@
     capEl.textContent = `$${formatNumber(price * supply)}`;
     supplyEl.textContent = formatNumber(supply);
     if (chartEl) {
-      chartEl.style.filter = `hue-rotate(${Math.round(drift * 4000)}deg)`;
+      const labels = ["Apr 10", "Apr 11", "Apr 12", "Apr 13", "Apr 14", "Apr 15", "Apr 16"];
+      const data = [0.05, 0.06, 0.07, 0.065, 0.08, 0.085, 0.09].map((value, index) => {
+        const noise = Math.sin(Date.now() / 60000 + index * 1.7) * 0.002;
+        return Number((value + noise).toFixed(3));
+      });
+      const minY = 0.04;
+      const maxY = 0.20;
+      const points = data.map((value, index) => {
+        const x = 58 + index * 54;
+        const y = 142 - ((value - minY) / (maxY - minY)) * 104;
+        return [x, y];
+      });
+      const pointString = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+      const yLabels = [0.05, 0.10, 0.15, 0.20];
+      chartEl.innerHTML = `
+        <svg viewBox="0 0 430 188" class="line-chart" role="img" aria-label="EVFI price over time">
+          <defs>
+            <linearGradient id="evfiLineFill" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stop-color="rgba(32,227,124,.22)" />
+              <stop offset="100%" stop-color="rgba(32,227,124,0)" />
+            </linearGradient>
+          </defs>
+          <rect x="0" y="0" width="430" height="188" rx="18" fill="transparent"></rect>
+          ${yLabels.map((label) => {
+            const y = 142 - ((label - minY) / (maxY - minY)) * 104;
+            return `<line x1="48" x2="398" y1="${y}" y2="${y}" stroke="rgba(210,216,228,.16)" stroke-width="1"/><text x="10" y="${y + 4}" fill="rgba(210,216,228,.62)" font-size="11">${label.toFixed(2)}</text>`;
+          }).join("")}
+          ${labels.map((label, index) => {
+            const x = 58 + index * 54;
+            return `<line x1="${x}" x2="${x}" y1="34" y2="146" stroke="rgba(210,216,228,.08)" stroke-width="1"/><text x="${x - 18}" y="170" fill="rgba(210,216,228,.62)" font-size="10">${label}</text>`;
+          }).join("")}
+          <text x="8" y="24" fill="rgba(210,216,228,.7)" font-size="11">Price</text>
+          <text x="368" y="184" fill="rgba(210,216,228,.7)" font-size="11">Date</text>
+          <polygon points="${points[0][0]},142 ${pointString} ${points[points.length - 1][0]},142" fill="url(#evfiLineFill)"></polygon>
+          <polyline points="${pointString}" fill="none" stroke="#20e37c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>
+          ${points.map(([x, y]) => `<circle cx="${x}" cy="${y}" r="3" fill="#20e37c" stroke="#071018" stroke-width="2"></circle>`).join("")}
+        </svg>`;
+      fetch("/api/log-ui-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "chart_data_updated", points: data.length }),
+      }).catch(() => {});
     }
+  }
+
+  function animateCountUp() {
+    document.querySelectorAll("[data-count-up]").forEach((el) => {
+      const target = Number(el.dataset.countUp || 0);
+      const suffix = el.textContent.replace(/[0-9.,-]/g, "").trim();
+      const start = performance.now();
+      const duration = 300;
+      const step = (now) => {
+        const progress = Math.min(1, (now - start) / duration);
+        const value = target * progress;
+        el.textContent = `${formatNumber(value)}${suffix ? ` ${suffix}` : ""}`;
+        if (progress < 1) {
+          requestAnimationFrame(step);
+        }
+      };
+      requestAnimationFrame(step);
+    });
   }
 
   async function activateSportMode() {
@@ -617,6 +677,7 @@
 
   resetWalletView();
   updateMockTokenMetrics();
+  animateCountUp();
   window.setInterval(updateMockTokenMetrics, 5000);
 
   if (!cfg.tokenAddress || !cfg.rewardsAddress) {

@@ -102,6 +102,20 @@ def fmt2(value):
         return "0.00"
 
 
+def fmt2_grouped(value):
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def value_tone(value):
+    try:
+        return "positive" if float(value) > 0 else "negative"
+    except (TypeError, ValueError):
+        return "negative"
+
+
 def fmt_ts(value):
     return time.strftime("%b %d, %Y %I:%M %p", time.localtime(int(value))) if value else "Never"
 
@@ -205,6 +219,28 @@ def init_db():
         claimed INTEGER DEFAULT 0,
         claimed_at INTEGER,
         UNIQUE(user_id, week_start, week_end)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mission_badges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        mission_type TEXT,
+        week_start INTEGER,
+        badge_asset TEXT,
+        created_at INTEGER,
+        UNIQUE(user_id, mission_type, week_start)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS weekly_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        week_start INTEGER,
+        reset_at INTEGER,
+        UNIQUE(user_id, week_start)
     )
     """)
 
@@ -419,19 +455,19 @@ BASE_CSS = """
     .vehicle-list{
         display:grid;
         grid-template-columns:repeat(auto-fit, minmax(300px,1fr));
-        gap:18px;
+        gap:16px;
     }
 
     .vehicle-card,
     .panel, .stat-card, .vehicle-panel, .history-panel{
         background:linear-gradient(180deg, rgba(18,20,27,.96), rgba(14,17,24,.98));
         border:1px solid var(--stroke);
-        border-radius:24px;
+        border-radius:16px;
         box-shadow:var(--shadow);
     }
 
     .vehicle-card{
-        padding:22px;
+        padding:20px;
     }
 
     .vehicle-card h3{
@@ -456,8 +492,8 @@ BASE_CSS = """
     .topbar{
         display:grid;
         grid-template-columns:minmax(0, 1.16fr) minmax(360px, .84fr);
-        gap:22px;
-        margin-bottom:22px;
+        gap:16px;
+        margin-bottom:16px;
         align-items:stretch;
     }
 
@@ -497,7 +533,7 @@ BASE_CSS = """
     .hero-vehicle{
         display:grid;
         grid-template-columns:minmax(0, 1.1fr) 220px;
-        gap:22px;
+        gap:16px;
         align-items:center;
         background:
             radial-gradient(circle at 18% 16%, rgba(255,45,70,.16), transparent 26%),
@@ -689,7 +725,7 @@ BASE_CSS = """
     }
 
     .wallet-panel{
-        padding:24px;
+        padding:20px;
         position:relative;
         overflow:hidden;
         background:
@@ -1053,22 +1089,24 @@ BASE_CSS = """
     .dashboard-grid{
         display:grid;
         grid-template-columns:1.05fr .95fr;
-        gap:22px;
+        gap:16px;
     }
 
     .stack{
         display:grid;
-        gap:22px;
+        gap:16px;
     }
 
     .stats-grid{
         display:grid;
         grid-template-columns:repeat(2, minmax(0,1fr));
-        gap:18px;
+        gap:16px;
     }
 
     .secondary-card{
-        padding:24px;
+        padding:20px;
+        border-radius:16px;
+        overflow:hidden;
     }
 
     .secondary-card-title{
@@ -1148,7 +1186,54 @@ BASE_CSS = """
     }
 
     .v2-score-grid{
-        margin-top:22px;
+        margin-top:16px;
+        grid-template-columns:repeat(4, minmax(0,1fr));
+    }
+
+    .score-card{
+        border-color:rgba(32,227,124,.18);
+        box-shadow:0 0 32px rgba(32,227,124,.08);
+        background:linear-gradient(180deg, rgba(32,227,124,.06), rgba(255,255,255,.02));
+    }
+
+    .streak-card{
+        border-color:rgba(105,167,255,.18);
+        box-shadow:0 0 32px rgba(105,167,255,.08);
+        background:linear-gradient(180deg, rgba(105,167,255,.06), rgba(255,255,255,.02));
+    }
+
+    .missions-card{
+        border-color:rgba(181,104,255,.18);
+        box-shadow:0 0 32px rgba(181,104,255,.08);
+        background:linear-gradient(180deg, rgba(181,104,255,.06), rgba(255,255,255,.02));
+    }
+
+    .distribution-card{
+        border-color:rgba(255,205,92,.2);
+        box-shadow:0 0 32px rgba(255,205,92,.09);
+        background:linear-gradient(180deg, rgba(255,205,92,.07), rgba(255,255,255,.02));
+        position:relative;
+    }
+
+    .distribution-card::after{
+        content:"";
+        position:absolute;
+        right:18px;
+        top:18px;
+        width:8px;
+        height:8px;
+        border-radius:50%;
+        background:#ffcd5c;
+        box-shadow:0 0 0 0 rgba(255,205,92,.45);
+        animation:sparkle .3s ease-out;
+    }
+
+    .value-tone-positive{
+        color:var(--green);
+    }
+
+    .value-tone-negative{
+        color:var(--red);
     }
 
     .mission-list{
@@ -1170,12 +1255,51 @@ BASE_CSS = """
 
     .mission-pill{
         border-radius:999px;
-        padding:6px 10px;
+        padding:6px 12px;
         color:#dfe7f6;
-        background:rgba(105,167,255,.12);
-        border:1px solid rgba(105,167,255,.2);
+        font-weight:600;
         font-size:12px;
         white-space:nowrap;
+    }
+
+    .mission-pill[data-state="active"]{
+        background:rgba(105,167,255,.14);
+        border:1px solid rgba(105,167,255,.28);
+        color:#b9d6ff;
+    }
+
+    .mission-pill[data-state="complete"]{
+        background:rgba(32,227,124,.14);
+        border:1px solid rgba(32,227,124,.3);
+        color:#c9ffdf;
+    }
+
+    .mission-pill[data-state="expired"]{
+        background:rgba(255,45,70,.13);
+        border:1px solid rgba(255,45,70,.3);
+        color:#ffc4cb;
+    }
+
+    .status-pill{
+        display:inline-flex;
+        align-items:center;
+        border-radius:999px;
+        padding:6px 12px;
+        font-weight:600;
+        font-size:12px;
+        margin-top:10px;
+    }
+
+    .status-pill[data-state="sport-active"]{
+        color:#ffe7c4;
+        background:rgba(255,145,66,.16);
+        border:1px solid rgba(255,145,66,.32);
+    }
+
+    .status-pill[data-state="sport-inactive"]{
+        color:#d2d8e4;
+        background:rgba(255,255,255,.05);
+        border:1px solid rgba(255,255,255,.08);
     }
 
     .token-metrics-panel{
@@ -1211,15 +1335,65 @@ BASE_CSS = """
     }
 
     .mock-chart{
-        height:72px;
+        height:188px;
         margin-top:14px;
         border-radius:18px;
-        background:
-            linear-gradient(135deg, transparent 8%, rgba(32,227,124,.22) 9%, transparent 10%),
-            linear-gradient(160deg, transparent 28%, rgba(105,167,255,.28) 29%, transparent 30%),
-            linear-gradient(175deg, transparent 52%, rgba(255,45,70,.24) 53%, transparent 54%),
-            rgba(255,255,255,.035);
+        background:linear-gradient(180deg, rgba(12,20,30,.92), rgba(4,8,13,.92));
         border:1px solid rgba(255,255,255,.06);
+        padding:0;
+        overflow:hidden;
+        position:relative;
+    }
+
+    .line-chart{
+        width:100%;
+        height:100%;
+        display:block;
+    }
+
+    .badge-display{
+        display:flex;
+        align-items:center;
+        gap:14px;
+        margin-top:16px;
+        padding:14px;
+        border-radius:18px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
+    .nft-badge{
+        width:72px;
+        height:72px;
+        border-radius:18px;
+        box-shadow:0 18px 40px rgba(32,227,124,.18);
+    }
+
+    .mission-badge{
+        width:42px;
+        height:42px;
+        border-radius:12px;
+        margin-right:10px;
+        filter:drop-shadow(0 0 12px rgba(32,227,124,.38));
+        animation:badgePop .3s ease-out;
+    }
+
+    .mission-copy{
+        display:flex;
+        align-items:center;
+        min-width:0;
+    }
+
+    .badge-label{
+        font-family:'Oxanium', sans-serif;
+        font-size:18px;
+        color:#f4f7fc;
+    }
+
+    .tesla-logo{
+        width:44px;
+        height:44px;
+        color:#fff;
     }
 
     .stat-card{
@@ -1338,9 +1512,6 @@ BASE_CSS = """
         display:flex;
         align-items:center;
         justify-content:center;
-        font-family:'Oxanium', sans-serif;
-        font-size:30px;
-        font-weight:700;
         color:#fff;
     }
 
@@ -1635,6 +1806,17 @@ BASE_CSS = """
         }
     }
 
+    @keyframes badgePop{
+        0%{ transform:scale(.82); opacity:.45; }
+        72%{ transform:scale(1.08); opacity:1; }
+        100%{ transform:scale(1); opacity:1; }
+    }
+
+    @keyframes sparkle{
+        0%{ transform:scale(.7); box-shadow:0 0 0 0 rgba(255,205,92,.45); opacity:.4; }
+        100%{ transform:scale(1); box-shadow:0 0 0 14px rgba(255,205,92,0); opacity:1; }
+    }
+
     @media (max-width: 1120px){
         .topbar{
             grid-template-columns:1fr;
@@ -1651,6 +1833,10 @@ BASE_CSS = """
         .stats-grid{
             grid-template-columns:repeat(2, minmax(0,1fr));
         }
+
+        .v2-score-grid{
+            grid-template-columns:repeat(2, minmax(0,1fr));
+        }
     }
 
     @media (max-width: 720px){
@@ -1659,6 +1845,10 @@ BASE_CSS = """
         }
 
         .stats-grid{
+            grid-template-columns:1fr;
+        }
+
+        .v2-score-grid{
             grid-template-columns:1fr;
         }
 
@@ -1924,6 +2114,7 @@ def mission_points(mission_type):
 def upsert_mission(user_id, mission_type, progress, completed):
     conn = get_db_connection()
     cur = conn.cursor()
+    week_start, _ = current_week_bounds()
     completed_at = now_ts() if completed else None
     cur.execute(
         """
@@ -1940,13 +2131,52 @@ def upsert_mission(user_id, mission_type, progress, completed):
         """,
         (user_id, mission_type, progress, 1 if completed else 0, completed_at),
     )
+    if completed:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO mission_badges
+            (user_id, mission_type, week_start, badge_asset, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, mission_type, week_start, "/static/evfi-badge-genesis.svg", now_ts()),
+        )
     conn.commit()
     if completed:
+        log_v2_event("badge_generated", user_id=user_id, mission_type=mission_type, week_start=week_start)
         log_v2_event("mission_completion", user_id=user_id, mission_type=mission_type, progress=progress)
     conn.close()
 
 
+def ensure_weekly_reset(user_id):
+    week_start, _ = current_week_bounds()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM weekly_resets WHERE user_id = ? AND week_start = ?", (user_id, week_start))
+    already_reset = cur.fetchone()
+    if already_reset:
+        conn.close()
+        return
+
+    cur.execute("SELECT COUNT(*) AS count FROM weekly_resets WHERE user_id = ?", (user_id,))
+    has_prior_reset = int(cur.fetchone()["count"] or 0) > 0
+    cur.execute(
+        "INSERT OR IGNORE INTO weekly_resets (user_id, week_start, reset_at) VALUES (?, ?, ?)",
+        (user_id, week_start, now_ts()),
+    )
+    if has_prior_reset:
+        cur.execute(
+            "UPDATE missions SET progress = 0, completed = 0, completed_at = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        cur.execute("DELETE FROM mission_badges WHERE user_id = ?", (user_id,))
+        log_v2_event("mission_reset", user_id=user_id, week_start=week_start)
+        log_v2_event("weekly_reset_triggered", user_id=user_id, week_start=week_start)
+    conn.commit()
+    conn.close()
+
+
 def get_completed_mission_bonus(user_id):
+    ensure_weekly_reset(user_id)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT mission_type FROM missions WHERE user_id = ? AND completed = 1", (user_id,))
@@ -1986,6 +2216,7 @@ def calculate_streak_multiplier(active_days):
 
 
 def update_missions(user_id, verified_miles, active_days, charge_health_score):
+    ensure_weekly_reset(user_id)
     upsert_mission(user_id, "sync_vehicle", 1, True)
     upsert_mission(user_id, "drive_once_today", 1 if verified_miles >= MINIMUM_TRIP_DISTANCE else 0, verified_miles >= MINIMUM_TRIP_DISTANCE)
     upsert_mission(user_id, "efficient_trip", 1 if charge_health_score >= 100 else 0, charge_health_score >= 100)
@@ -2106,9 +2337,23 @@ def get_last_distribution(user_id):
 
 
 def get_user_missions(user_id):
+    ensure_weekly_reset(user_id)
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM missions WHERE user_id = ? ORDER BY completed ASC, mission_type ASC", (user_id,))
+    week_start, _ = current_week_bounds()
+    cur.execute(
+        """
+        SELECT m.*, b.badge_asset
+        FROM missions m
+        LEFT JOIN mission_badges b
+          ON b.user_id = m.user_id
+         AND b.mission_type = m.mission_type
+         AND b.week_start = ?
+        WHERE m.user_id = ?
+        ORDER BY m.completed ASC, m.mission_type ASC
+        """,
+        (week_start, user_id),
+    )
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -2790,7 +3035,7 @@ def dashboard(vid):
             <td>{escape(synced_at_str)}</td>
             <td>{fmt2(e["odometer_reading"])}</td>
             <td>{fmt2(e["miles_added"])}</td>
-            <td class="gain">+{fmt2(e["drv_earned"])}</td>
+            <td class="gain value-tone-{value_tone(e["drv_earned"])}">+{fmt2(e["drv_earned"])}</td>
         </tr>
         """
 
@@ -2805,18 +3050,33 @@ def dashboard(vid):
     last_synced_str = fmt_ts(last_synced)
     score_updated_str = fmt_ts(weekly_score["created_at"] if weekly_score else None)
     distribution_updated_str = fmt_ts(last_distribution["claimed_at"] if last_distribution and last_distribution["claimed_at"] else (last_distribution["week_end"] if last_distribution else None))
-    last_distribution_value = fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)
+    last_distribution_value = fmt2_grouped(last_distribution["evfi_allocated"] if last_distribution else 0)
     airdrop_status = "Airdrop Claimed" if airdrop_claim and airdrop_claim["claimed"] else "Airdrop Available"
     airdrop_amount = fmt2(airdrop_claim["evfi_allocated"] if airdrop_claim else current_odometer)
+    badge_label = "Sync Vehicle"
+    for badge_candidate in ("stay_active_all_week", "drive_on_5_days", "efficient_trip", "drive_once_today", "sync_vehicle"):
+        if any(m["mission_type"] == badge_candidate and m["completed"] for m in missions):
+            badge_label = badge_candidate.replace("_", " ").title()
+            break
     mission_rows = ""
     for mission in missions:
+        mission_complete = bool(mission["completed"])
+        mission_state = "complete" if mission_complete else "active"
+        badge_html = (
+            f'<img class="mission-badge" src="{escape(mission["badge_asset"])}" alt="Completed mission badge">'
+            if mission_complete and mission["badge_asset"]
+            else ""
+        )
         mission_rows += f"""
         <div class="mission-row">
-            <div>
-                <strong>{escape(str(mission["mission_type"]).replace("_", " ").title())}</strong>
-                <div class="sub">Progress: {fmt2(mission["progress"])}</div>
+            <div class="mission-copy">
+                {badge_html}
+                <div>
+                    <strong>{escape(str(mission["mission_type"]).replace("_", " ").title())}</strong>
+                    <div class="sub">Progress: <span class="value-tone-{value_tone(mission["progress"])}">{fmt2(mission["progress"])}</span></div>
+                </div>
             </div>
-            <span class="mission-pill">{'Complete' if mission["completed"] else 'Active'}</span>
+            <span class="mission-pill" data-state="{mission_state}">{'Complete' if mission_complete else 'Active'}</span>
         </div>
         """
     if not mission_rows:
@@ -2831,7 +3091,11 @@ def dashboard(vid):
                     <h2 class="vehicle-title">{escape(display_name)}</h2>
                     <div class="vehicle-sub">{escape(str(year))} {escape(model)} • {escape(trim)} • {escape(str(vehicle_state).title())}</div>
                 </div>
-                <div class="tesla-mark">T</div>
+                <div class="tesla-mark" aria-label="Tesla logo">
+                    <svg class="tesla-logo" viewBox="0 0 64 64" role="img" aria-hidden="true">
+                        <path fill="currentColor" d="M12 12c10.8-4.2 29.2-4.2 40 0 1.7.7 2.2 2.9.9 4.2-3.2 3.2-8.3 4.9-14.9 5.4l-5.1 31.2c-.2 1.3-1.3 2.2-2.6 2.2h-.6c-1.3 0-2.4-.9-2.6-2.2L22 21.6c-6.6-.5-11.7-2.2-14.9-5.4-1.3-1.3-.8-3.5.9-4.2Zm9.8 5.1h20.4c-5.8-1.8-14.6-1.8-20.4 0Zm6.3 3.1 3.9 23.7 3.9-23.7h-7.8Z"/>
+                    </svg>
+                </div>
             </div>
 
             <div class="soc-row">
@@ -2856,7 +3120,7 @@ def dashboard(vid):
                 <button id="assignRewardsButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{build_demo_assignment_amount(summary)}">Assign Test EVFI</button>
                 <button class="quick-btn" onclick="alert('Vehicle controls can be wired next')">Controls</button>
             </div>
-            <div id="sportModeStatus" class="sub">{'SPORT MODE ACTIVE - ' + str(sport_countdown) + 's remaining' if sport_active else 'Sport Mode available: 15 minutes, 1 use per day.'}</div>
+            <div id="sportModeStatus" class="status-pill" data-state="{'sport-active' if sport_active else 'sport-inactive'}">{'SPORT MODE ACTIVE - ' + str(sport_countdown) + 's remaining' if sport_active else 'Sport Mode available: 15 minutes, 1 use per day.'}</div>
             <div class="admin-stack">
                 <input id="distributionRecipientInput" class="admin-input" type="text" value="{escape(DEFAULT_WALLET_ADDRESS)}" placeholder="Distribution recipient wallet 0x...">
                 <input id="adminKeyInput" class="admin-input" type="password" placeholder="Admin API key">
@@ -2943,42 +3207,49 @@ def dashboard(vid):
             <div class="token-metrics-panel">
                 <div class="label">EvFi Token Metrics</div>
                 <div class="token-metrics-grid">
-                    <div><span>Mock Price</span><strong id="mockEvfiPrice">$0.04</strong></div>
+                    <div><span>Price</span><strong id="mockEvfiPrice">$0.04</strong></div>
                     <div><span>Market Cap</span><strong id="mockMarketCap">$4,000,000.00</strong></div>
                     <div><span>Circulating</span><strong id="mockCirculatingSupply">100,000,000.00</strong></div>
                     <div><span>Max Supply</span><strong>1,000,000,000.00</strong></div>
                 </div>
-                <div class="mock-chart" id="mockPriceChart" aria-label="Mock EVFI price chart"></div>
+                <div class="mock-chart" id="mockPriceChart" aria-label="EVFI price candle chart"></div>
             </div>
         </section>
     </section>
 
     <section class="stats-grid v2-score-grid">
-        <section class="panel secondary-card">
+        <section class="panel secondary-card score-card">
             <div class="label">Weekly Score</div>
-            <h3 class="secondary-card-title">{fmt2(weekly_score["total_score"] if weekly_score else 0)} pts</h3>
+            <h3 class="secondary-card-title value-tone-{value_tone(weekly_score["total_score"] if weekly_score else 0)}" data-count-up="{fmt2(weekly_score["total_score"] if weekly_score else 0)}">{fmt2(weekly_score["total_score"] if weekly_score else 0)} pts</h3>
             <p class="secondary-card-copy">Verified miles, active days, charge health, streak multiplier, and mission bonuses.</p>
             <div class="sub">Updated {escape(score_updated_str)}</div>
         </section>
 
-        <section class="panel secondary-card">
+        <section class="panel secondary-card streak-card">
             <div class="label">Active Streak</div>
             <h3 class="secondary-card-title">{weekly_score["active_days"] if weekly_score else 0} active days</h3>
             <p class="secondary-card-copy">Multiplier: {fmt2(weekly_score["streak_multiplier"] if weekly_score else 1.0)}x</p>
             <div class="sub">Updated {escape(score_updated_str)}</div>
         </section>
 
-        <section class="panel secondary-card">
+        <section class="panel secondary-card missions-card">
             <div class="label">Active Missions</div>
-            <h3 class="secondary-card-title">{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)} bonus pts</h3>
+            <h3 class="secondary-card-title value-tone-{value_tone(weekly_score["mission_bonus"] if weekly_score else 0)}" data-count-up="{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)}">{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)} bonus pts</h3>
             <div class="mission-list">{mission_rows}</div>
             <div class="sub">Updated {escape(score_updated_str)}</div>
         </section>
 
-        <section class="panel secondary-card">
+        <section class="panel secondary-card distribution-card">
             <div class="label">Last Distribution</div>
-            <h3 class="secondary-card-title">{last_distribution_value} EVFI</h3>
+            <h3 class="secondary-card-title value-tone-{value_tone(last_distribution["evfi_allocated"] if last_distribution else 0)}" data-count-up="{fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)}">{last_distribution_value} EVFI</h3>
             <p class="secondary-card-copy">Fixed-pool deterministic allocation with weekly caps.</p>
+            <div class="badge-display">
+                <img class="nft-badge" src="/static/evfi-badge-genesis.svg" alt="Generated achievement badge">
+                <div>
+                    <div class="badge-label">{escape(badge_label)}</div>
+                    <div class="sub">Achievement badge attached to the latest completed challenge.</div>
+                </div>
+            </div>
             <div class="sub">Updated {escape(distribution_updated_str)}</div>
         </section>
     </section>
@@ -3021,15 +3292,15 @@ def dashboard(vid):
             <div class="distribution-grid">
                 <div class="distribution-stat">
                     <div class="distribution-label">Telemetry Score</div>
-                    <div class="distribution-value">{float(summary["drv_balance"]):.1f}</div>
+                    <div class="distribution-value value-tone-{value_tone(summary["drv_balance"])}">{fmt2_grouped(summary["drv_balance"])}</div>
                 </div>
                 <div class="distribution-stat">
                     <div class="distribution-label">Miles Tracked</div>
-                    <div class="distribution-value">{float(summary["total_miles"]):.1f}</div>
+                    <div class="distribution-value value-tone-{value_tone(summary["total_miles"])}">{fmt2_grouped(summary["total_miles"])}</div>
                 </div>
                 <div class="distribution-stat">
                     <div class="distribution-label">Airdrop Amount</div>
-                    <div class="distribution-value">{build_demo_assignment_amount(summary):.1f}</div>
+                    <div class="distribution-value value-tone-{value_tone(build_demo_assignment_amount(summary))}">{fmt2_grouped(build_demo_assignment_amount(summary))}</div>
                 </div>
             </div>
 
@@ -3037,7 +3308,7 @@ def dashboard(vid):
         </section>
     </section>
 
-    <section class="dashboard-grid" style="margin-top:22px;">
+    <section class="dashboard-grid" style="margin-top:16px;">
         <section class="history-panel">
             <h3 class="history-title">Reward Sync History</h3>
             <table>
@@ -3300,6 +3571,15 @@ def activate_sport_mode(vid):
     conn.close()
     log_v2_event("sport_mode_activation", user_id=user["id"], vehicle_id=vid, end_time=end_time)
     return jsonify({"ok": True, "active": True, "startTime": current, "endTime": end_time})
+
+
+@app.route("/api/log-ui-event", methods=["POST"])
+def log_ui_event():
+    payload = request.get_json(silent=True) or {}
+    event_name = str(payload.get("event") or "ui_event")
+    if event_name == "chart_data_updated":
+        log_v2_event("chart_data_updated", points=payload.get("points"))
+    return jsonify({"ok": True})
 
 
 @app.route("/vehicle/<vid>/raw")

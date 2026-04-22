@@ -1,6 +1,7 @@
-import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { network } from "hardhat";
+
+const { ethers, networkHelpers } = await network.create();
 
 describe("EvFi phase 1 contracts", function () {
   async function deployFixture() {
@@ -36,7 +37,7 @@ describe("EvFi phase 1 contracts", function () {
   }
 
   it("mints initial circulating supply to treasury and preserves the fixed cap", async function () {
-    const { token, treasury, maxSupply } = await loadFixture(deployFixture);
+    const { token, treasury, maxSupply } = await networkHelpers.loadFixture(deployFixture);
     const initialTreasuryMint = maxSupply / 10n;
 
     expect(await token.totalSupply()).to.equal(initialTreasuryMint);
@@ -44,7 +45,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("allows authorized airdrop minting up to the cap", async function () {
-    const { token, admin, userOne } = await loadFixture(deployFixture);
+    const { token, admin, userOne } = await networkHelpers.loadFixture(deployFixture);
     const amount = ethers.parseUnits("123", 18);
 
     await token.connect(admin).mint(userOne.address, amount);
@@ -53,7 +54,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("assigns and claims rewards from a funded pool", async function () {
-    const { rewards, token, userOne } = await loadFixture(deployFixture);
+    const { rewards, token, userOne } = await networkHelpers.loadFixture(deployFixture);
     const rewardAmount = ethers.parseUnits("125", 18);
 
     await expect(rewards.assignRewards(userOne.address, rewardAmount, "week-1"))
@@ -72,7 +73,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("supports batched weekly reward assignments", async function () {
-    const { rewards, userOne, userTwo } = await loadFixture(deployFixture);
+    const { rewards, userOne, userTwo } = await networkHelpers.loadFixture(deployFixture);
     const rewardOne = ethers.parseUnits("40", 18);
     const rewardTwo = ethers.parseUnits("60", 18);
 
@@ -93,7 +94,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("blocks batch assignments that exceed the weekly pool", async function () {
-    const { rewards, userOne, weeklyRewardPool } = await loadFixture(deployFixture);
+    const { rewards, userOne, weeklyRewardPool } = await networkHelpers.loadFixture(deployFixture);
 
     await expect(
       rewards.assignRewardsBatch([userOne.address], [weeklyRewardPool + 1n], "too-large"),
@@ -101,8 +102,10 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("blocks assignments that exceed funded rewards balance", async function () {
-    const { rewards, userOne, initialFunding } = await loadFixture(deployFixture);
+    const { rewards, userOne, initialFunding } = await networkHelpers.loadFixture(deployFixture);
     const tooMuch = initialFunding + 1n;
+
+    await rewards.setWeeklyRewardPool(tooMuch);
 
     await expect(rewards.assignRewards(userOne.address, tooMuch, "overflow")).to.be.revertedWithCustomError(
       rewards,
@@ -111,7 +114,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("restricts reward management to authorized accounts", async function () {
-    const { rewards, outsider, userOne } = await loadFixture(deployFixture);
+    const { rewards, outsider, userOne } = await networkHelpers.loadFixture(deployFixture);
 
     await expect(
       rewards.connect(outsider).assignRewards(userOne.address, ethers.parseUnits("10", 18), "nope"),
@@ -119,7 +122,7 @@ describe("EvFi phase 1 contracts", function () {
   });
 
   it("allows the admin to reconfigure the weekly pool", async function () {
-    const { rewards, weeklyRewardPool } = await loadFixture(deployFixture);
+    const { rewards, weeklyRewardPool } = await networkHelpers.loadFixture(deployFixture);
     const newPool = weeklyRewardPool * 2n;
 
     await expect(rewards.setWeeklyRewardPool(newPool))

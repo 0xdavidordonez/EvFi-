@@ -1,4 +1,5 @@
-import { HardhatUserConfig } from "hardhat/config";
+import hardhatToolboxMochaEthersPlugin from "@nomicfoundation/hardhat-toolbox-mocha-ethers";
+import { defineConfig } from "hardhat/config";
 import * as dotenv from "dotenv";
 dotenv.config();
 
@@ -13,7 +14,8 @@ function normalizePrivateKey(value?: string) {
 const sepoliaUrl = process.env.SEPOLIA_RPC_URL || process.env.ALCHEMY_SEPOLIA_URL || "";
 const deployerKey = normalizePrivateKey(process.env.DEPLOYER_PRIVATE_KEY || process.env.PRIVATE_KEY);
 
-const config: HardhatUserConfig = {
+const config = defineConfig({
+  plugins: [hardhatToolboxMochaEthersPlugin],
   solidity: {
     version: "0.8.28",
     settings: {
@@ -38,6 +40,6 @@ const config: HardhatUserConfig = {
   etherscan: {
     apiKey: process.env.ETHERSCAN_API_KEY || "",
   },
-};
+});
 
 export default config;

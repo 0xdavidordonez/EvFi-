@@ -53,6 +53,20 @@ describe("EvFi phase 1 contracts", function () {
     expect(await token.balanceOf(userOne.address)).to.equal(amount);
   });
 
+  it("blocks unauthorized token minting and mints beyond the cap", async function () {
+    const { token, outsider, userOne, maxSupply } = await networkHelpers.loadFixture(deployFixture);
+
+    await expect(token.connect(outsider).mint(userOne.address, 1n)).to.be.revertedWithCustomError(
+      token,
+      "AccessControlUnauthorizedAccount",
+    );
+
+    await expect(token.mint(userOne.address, maxSupply)).to.be.revertedWithCustomError(
+      token,
+      "ERC20ExceededCap",
+    );
+  });
+
   it("assigns and claims rewards from a funded pool", async function () {
     const { rewards, token, userOne } = await networkHelpers.loadFixture(deployFixture);
     const rewardAmount = ethers.parseUnits("125", 18);
@@ -70,6 +84,15 @@ describe("EvFi phase 1 contracts", function () {
     expect(await rewards.pendingRewards(userOne.address)).to.equal(0n);
     expect(await rewards.totalClaimed(userOne.address)).to.equal(rewardAmount);
     expect(await token.balanceOf(userOne.address)).to.equal(rewardAmount);
+  });
+
+  it("blocks claims when the account has no rewards", async function () {
+    const { rewards, userOne } = await networkHelpers.loadFixture(deployFixture);
+
+    await expect(rewards.connect(userOne).claim()).to.be.revertedWithCustomError(
+      rewards,
+      "EvFiRewards__NoRewards",
+    );
   });
 
   it("supports batched weekly reward assignments", async function () {
@@ -91,6 +114,29 @@ describe("EvFi phase 1 contracts", function () {
     expect(await rewards.pendingRewards(userTwo.address)).to.equal(rewardTwo);
     expect(await rewards.totalPendingRewards()).to.equal(rewardOne + rewardTwo);
     expect(await rewards.currentWeek()).to.equal(2n);
+  });
+
+  it("rejects invalid reward recipients and amounts", async function () {
+    const { rewards, userOne } = await networkHelpers.loadFixture(deployFixture);
+
+    await expect(rewards.assignRewards(ethers.ZeroAddress, 1n, "bad-account")).to.be.revertedWithCustomError(
+      rewards,
+      "EvFiRewards__InvalidAddress",
+    );
+
+    await expect(rewards.assignRewards(userOne.address, 0n, "zero")).to.be.revertedWithCustomError(
+      rewards,
+      "EvFiRewards__InvalidAmount",
+    );
+
+    await expect(rewards.assignRewardsBatch([], [], "empty")).to.be.revertedWithCustomError(
+      rewards,
+      "EvFiRewards__InvalidArrayLength",
+    );
+
+    await expect(
+      rewards.assignRewardsBatch([userOne.address], [0n], "zero-batch"),
+    ).to.be.revertedWithCustomError(rewards, "EvFiRewards__InvalidAmount");
   });
 
   it("blocks batch assignments that exceed the weekly pool", async function () {
@@ -121,6 +167,25 @@ describe("EvFi phase 1 contracts", function () {
     ).to.be.revertedWithCustomError(rewards, "AccessControlUnauthorizedAccount");
   });
 
+  it("blocks reward assignment and claims while paused", async function () {
+    const { rewards, userOne } = await networkHelpers.loadFixture(deployFixture);
+    const rewardAmount = ethers.parseUnits("25", 18);
+
+    await rewards.assignRewards(userOne.address, rewardAmount, "pause-check");
+    await rewards.pause();
+
+    await expect(rewards.assignRewards(userOne.address, rewardAmount, "paused")).to.be.revertedWithCustomError(
+      rewards,
+      "EnforcedPause",
+    );
+    await expect(rewards.connect(userOne).claim()).to.be.revertedWithCustomError(rewards, "EnforcedPause");
+
+    await rewards.unpause();
+    await expect(rewards.connect(userOne).claim())
+      .to.emit(rewards, "RewardClaimed")
+      .withArgs(userOne.address, rewardAmount);
+  });
+
   it("allows the admin to reconfigure the weekly pool", async function () {
     const { rewards, weeklyRewardPool } = await networkHelpers.loadFixture(deployFixture);
     const newPool = weeklyRewardPool * 2n;
@@ -130,5 +195,24 @@ describe("EvFi phase 1 contracts", function () {
       .withArgs(weeklyRewardPool, newPool);
 
     expect(await rewards.weeklyRewardPool()).to.equal(newPool);
+  });
+
+  it("rescues only unallocated reward tokens", async function () {
+    const { rewards, token, treasury, userOne, initialFunding } = await networkHelpers.loadFixture(deployFixture);
+    const pendingAmount = ethers.parseUnits("100", 18);
+    const rescueAmount = ethers.parseUnits("500", 18);
+
+    await rewards.assignRewards(userOne.address, pendingAmount, "reserved");
+
+    await expect(
+      rewards.rescueUnallocatedTokens(treasury.address, initialFunding - pendingAmount + 1n),
+    ).to.be.revertedWithCustomError(rewards, "EvFiRewards__InsufficientFunding");
+
+    await expect(rewards.rescueUnallocatedTokens(treasury.address, rescueAmount))
+      .to.emit(rewards, "UnallocatedTokensRescued")
+      .withArgs(treasury.address, rescueAmount);
+
+    expect(await rewards.totalPendingRewards()).to.equal(pendingAmount);
+    expect(await token.balanceOf(await rewards.getAddress())).to.equal(initialFunding - rescueAmount);
   });
 });

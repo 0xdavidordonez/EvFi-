@@ -124,6 +124,14 @@ npm run deploy:sepolia
 
 Deployment output is written to `deployments/sepolia.json`.
 
+Current Sepolia deployment:
+
+- EvFiToken: [`0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F`](https://sepolia.etherscan.io/address/0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F)
+- EvFiRewards: [`0x02B6aA5aAc691E7CDA8a91AfE9457805368DF8e0`](https://sepolia.etherscan.io/address/0x02B6aA5aAc691E7CDA8a91AfE9457805368DF8e0)
+- EVFI decimals: `18`
+
+If MetaMask shows a balance that is off by thousands or millions while the dashboard shows the correct live balance, remove the imported EVFI token from MetaMask and import the token address above again. The deployed ERC-20 reports `18` decimals onchain.
+
 ## Running The Demo App
 
 Start the Flask app:
@@ -158,4 +166,4 @@ If you are testing through ngrok, update both Tesla developer settings and `TESL
 
 ## Status
 
-This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase, new features and improvements will come in V2 and V3. contract adress: 0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F([https://sepolia.etherscan.io/address/0xE8d308592562a1A3BdBb2F57BD52633Dd46fa47F])
+This is an active prototype repository consolidating the Tesla Fleet demo app and the onchain EVFI rewards flow into one codebase. New features and improvements will come in V2 and V3.

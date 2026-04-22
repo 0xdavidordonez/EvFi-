@@ -33,12 +33,14 @@
     provider: null,
     signer: null,
     address: cfg.defaultWalletAddress || "",
+    tokenDecimals: 18,
     toastTimer: null,
     connectState: "idle",
   };
 
   const tokenAbi = [
     "function balanceOf(address) view returns (uint256)",
+    "function decimals() view returns (uint8)",
   ];
 
   const rewardsAbi = [
@@ -129,7 +131,7 @@
   }
 
   function formatToken(value) {
-    return Number(ethers.formatUnits(value, 18)).toLocaleString(undefined, {
+    return Number(ethers.formatUnits(value, state.tokenDecimals)).toLocaleString(undefined, {
       maximumFractionDigits: 2,
     });
   }
@@ -267,10 +269,12 @@
     const rewards = new ethers.Contract(cfg.rewardsAddress, rewardsAbi, state.provider);
 
     try {
-      const [balance, pending] = await Promise.all([
+      const [balance, pending, decimals] = await Promise.all([
         token.balanceOf(state.address),
         rewards.pendingRewards(state.address),
+        token.decimals(),
       ]);
+      state.tokenDecimals = Number(decimals);
 
       if (els.balance) {
         els.balance.textContent = formatToken(balance);

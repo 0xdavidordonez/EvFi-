@@ -384,6 +384,44 @@ BASE_CSS = """
         box-shadow:var(--shadow);
         padding:28px;
         margin-bottom:22px;
+        position:relative;
+        overflow:hidden;
+    }
+
+    .hero-auth{
+        min-height:300px;
+        align-items:stretch;
+        background:
+            linear-gradient(112deg, rgba(4,9,22,.95) 0%, rgba(6,13,29,.9) 46%, rgba(8,14,28,.38) 100%),
+            url('/static/EVFi-banner-dark.png') right center / cover no-repeat;
+        border-color:rgba(110,188,255,.28);
+        box-shadow:0 26px 80px rgba(2,7,20,.62);
+    }
+
+    .hero-auth::before{
+        content:"";
+        position:absolute;
+        inset:0;
+        background:
+            radial-gradient(circle at 10% 12%, rgba(123,45,255,.26), transparent 42%),
+            radial-gradient(circle at 20% 82%, rgba(0,200,255,.2), transparent 48%);
+        pointer-events:none;
+    }
+
+    .hero-auth-copy{
+        position:relative;
+        z-index:1;
+        max-width:min(640px, 70%);
+        backdrop-filter:blur(1.5px);
+    }
+
+    .hero-auth-actions{
+        position:relative;
+        z-index:1;
+        display:flex;
+        align-items:flex-end;
+        justify-content:flex-end;
+        min-width:220px;
     }
 
     .hero h1{
@@ -1508,11 +1546,27 @@ BASE_CSS = """
         width:64px;
         height:64px;
         border-radius:18px;
-        background:rgba(255,255,255,.04);
+        background:
+            radial-gradient(circle at 25% 20%, rgba(122,44,255,.36), transparent 52%),
+            radial-gradient(circle at 78% 78%, rgba(0,200,255,.34), transparent 58%),
+            rgba(6,10,22,.88);
+        border:1px solid rgba(108,182,255,.5);
+        box-shadow:
+            inset 0 1px 0 rgba(255,255,255,.14),
+            0 16px 26px rgba(0,0,0,.42);
         display:flex;
         align-items:center;
         justify-content:center;
         color:#fff;
+        overflow:hidden;
+    }
+
+    .vehicle-brand-logo{
+        width:42px;
+        height:42px;
+        display:block;
+        object-fit:contain;
+        filter:drop-shadow(0 5px 11px rgba(0,0,0,.42));
     }
 
     .soc-row{
@@ -1826,6 +1880,21 @@ BASE_CSS = """
             grid-template-columns:1fr;
         }
 
+        .hero-auth{
+            min-height:320px;
+            background-position:75% center;
+        }
+
+        .hero-auth-copy{
+            max-width:100%;
+        }
+
+        .hero-auth-actions{
+            justify-content:flex-start;
+            align-items:flex-start;
+            min-width:0;
+        }
+
         .dashboard-grid{
             grid-template-columns:1fr;
         }
@@ -1882,6 +1951,12 @@ BASE_CSS = """
 
         .hero h1{
             font-size:38px;
+        }
+
+        .hero-auth{
+            min-height:360px;
+            background-position:72% center;
+            padding:24px;
         }
     }
 </style>
@@ -2807,13 +2882,13 @@ def index():
         })
 
         body = f"""
-        <section class="hero">
-            <div>
+        <section class="hero hero-auth">
+            <div class="hero-auth-copy">
                 <div class="badge">EvFi Phase 1</div>
                 <h1>Connect Tesla telemetry to EVFI rewards.</h1>
                 <p>Use live Tesla odometer data as the offchain score engine, then connect a Sepolia wallet to view and claim real EVFI rewards.</p>
             </div>
-            <div>
+            <div class="hero-auth-actions">
                 <a class="btn btn-primary" href="{url}">Login with Tesla</a>
             </div>
         </section>
@@ -2824,8 +2899,8 @@ def index():
 
     if not cars:
         body = """
-        <section class="hero">
-            <div>
+        <section class="hero hero-auth">
+            <div class="hero-auth-copy">
                 <div class="badge">Connected</div>
                 <h1>No vehicles found</h1>
                 <p>Your Tesla account authenticated successfully, but no vehicles were returned.</p>
@@ -2857,8 +2932,8 @@ def index():
         """
 
     body = f"""
-    <section class="hero">
-        <div>
+    <section class="hero hero-auth">
+        <div class="hero-auth-copy">
             <div class="badge">Connected</div>
             <h1>Your Tesla Vehicles</h1>
             <p>Select a vehicle to open the EvFi telemetry and rewards dashboard.</p>
@@ -3091,10 +3166,8 @@ def dashboard(vid):
                     <h2 class="vehicle-title">{escape(display_name)}</h2>
                     <div class="vehicle-sub">{escape(str(year))} {escape(model)} • {escape(trim)} • {escape(str(vehicle_state).title())}</div>
                 </div>
-                <div class="tesla-mark" aria-label="Tesla logo">
-                    <svg class="tesla-logo" viewBox="0 0 64 64" role="img" aria-hidden="true">
-                        <path fill="currentColor" d="M12 12c10.8-4.2 29.2-4.2 40 0 1.7.7 2.2 2.9.9 4.2-3.2 3.2-8.3 4.9-14.9 5.4l-5.1 31.2c-.2 1.3-1.3 2.2-2.6 2.2h-.6c-1.3 0-2.4-.9-2.6-2.2L22 21.6c-6.6-.5-11.7-2.2-14.9-5.4-1.3-1.3-.8-3.5.9-4.2Zm9.8 5.1h20.4c-5.8-1.8-14.6-1.8-20.4 0Zm6.3 3.1 3.9 23.7 3.9-23.7h-7.8Z"/>
-                    </svg>
+                <div class="tesla-mark" aria-label="EVFI logo">
+                    <img class="vehicle-brand-logo" src="/static/evfi-token-logo.png" alt="EVFI token logo">
                 </div>
             </div>
 

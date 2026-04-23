@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="EVFI token logo">
+  <defs>
+    <radialGradient id="coinFace" cx="50%" cy="42%" r="62%">
+      <stop offset="0%" stop-color="#102c68"/>
+      <stop offset="48%" stop-color="#07152d"/>
+      <stop offset="100%" stop-color="#020713"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="11%" y1="10%" x2="88%" y2="90%">
+      <stop offset="0%" stop-color="#b7f2ff"/>
+      <stop offset="18%" stop-color="#5aa8ff"/>
+      <stop offset="39%" stop-color="#7b2dff"/>
+      <stop offset="66%" stop-color="#00c8ff"/>
+      <stop offset="100%" stop-color="#eef9ff"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="24%" y1="25%" x2="77%" y2="76%">
+      <stop offset="0%" stop-color="#983cff"/>
+      <stop offset="43%" stop-color="#145fff"/>
+      <stop offset="100%" stop-color="#00e4ff"/>
+    </linearGradient>
+    <filter id="softGlow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.04 0 0 0 0 0.58 0 0 0 0 1 0 0 0 .7 0"/>
+      <feBlend in="SourceGraphic"/>
+    </filter>
+    <path id="topArc" d="M154 123a154 154 0 0 1 204 0"/>
+    <path id="bottomArc" d="M123 350a171 171 0 0 0 266 0"/>
+  </defs>
+
+  <rect width="512" height="512" fill="#020511"/>
+  <ellipse cx="256" cy="461" rx="142" ry="24" fill="#008cff" opacity=".22"/>
+  <ellipse cx="207" cy="461" rx="116" ry="18" fill="#7a2cff" opacity=".18"/>
+
+  <circle cx="256" cy="256" r="204" fill="url(#rim)" filter="url(#softGlow)"/>
+  <circle cx="256" cy="256" r="193" fill="#050b19"/>
+  <circle cx="256" cy="256" r="160" fill="url(#coinFace)" stroke="#66d9ff" stroke-width="3"/>
+  <circle cx="256" cy="256" r="132" fill="none" stroke="#2e73ff" stroke-width="1.5" opacity=".55"/>
+  <circle cx="256" cy="256" r="104" fill="none" stroke="#622cff" stroke-width="1.2" opacity=".5"/>
+
+  <g fill="none" stroke="#1d8eff" stroke-linecap="round" opacity=".45">
+    <path d="M256 116v62M256 334v62M116 256h62M334 256h62"/>
+    <path d="M206 129v34m-17-27v23m-17-13v24m-17 10h45m-35 18h35m-44 16h36"/>
+    <path d="M306 129v34m17-27v23m17-13v24m17 10h-45m35 18h-35m44 16h-36"/>
+    <path d="M206 383v-34m-17 27v-23m-17 13v-24m-17-10h45m-35-18h35m-44-16h36"/>
+    <path d="M306 383v-34m17 27v-23m17 13v-24m17-10h-45m35-18h-35m44-16h-36"/>
+  </g>
+
+  <circle cx="84" cy="256" r="7" fill="#9c4cff" stroke="#d9c5ff" stroke-width="2"/>
+  <circle cx="428" cy="256" r="7" fill="#59d4ff" stroke="#d7f7ff" stroke-width="2"/>
+
+  <g fill="#d8e7ff" font-family="Arial, Helvetica, sans-serif" font-weight="700" letter-spacing="16">
+    <text font-size="31">
+      <textPath href="#topArc" startOffset="50%" text-anchor="middle">EVFI</textPath>
+    </text>
+  </g>
+  <g fill="#d8e7ff" font-family="Arial, Helvetica, sans-serif" font-weight="700" letter-spacing="7">
+    <text font-size="22">
+      <textPath href="#bottomArc" startOffset="50%" text-anchor="middle">ELECTRIFIED PROTOCOL</textPath>
+    </text>
+  </g>
+
+  <g filter="url(#softGlow)">
+    <path d="M166 192h169c8 0 12 9 7 15l-26 33H197l-31-48Z" fill="url(#mark)"/>
+    <path d="M207 242h142c8 0 12 9 7 15l-27 35H238l-31-50Z" fill="url(#mark)"/>
+    <path d="M238 311h49l38 61c7 12 25 12 32 0l72-116h-47l-50 81-41-67h-84l31 41Z" fill="url(#mark)"/>
+    <path d="M197 214h128" stroke="#bfefff" stroke-opacity=".35" stroke-width="4" stroke-linecap="round"/>
+  </g>
+</svg>

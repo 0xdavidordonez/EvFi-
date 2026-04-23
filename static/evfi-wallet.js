@@ -252,7 +252,7 @@
             address: cfg.tokenAddress,
             symbol: "EVFI",
             decimals: state.tokenDecimals,
-            image: `${window.location.origin}/static/evfi-badge-genesis.svg`,
+            image: `${window.location.origin}/static/evfi-token-logo.svg`,
           },
         },
       });

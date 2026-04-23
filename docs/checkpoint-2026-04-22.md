@@ -7,6 +7,8 @@
 - Removed the skipped `test/Counter.ts` starter scaffold.
 - Expanded EvFi contract coverage to 13 active passing Mocha tests.
 - Verified Python app syntax and contract compilation.
+- Confirmed deployed Sepolia EVFI reports `18` decimals and wallet `0x9446D03c7572C05dE3cb7dE5345B51B71aE46492` holds `1168.6979 EVFI`.
+- Added wallet metadata registration so MetaMask is prompted to track the deployed EVFI token with the correct `18` decimals.
 
 ## Saved Commits
 

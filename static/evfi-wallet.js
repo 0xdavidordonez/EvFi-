@@ -34,6 +34,7 @@
     signer: null,
     address: cfg.defaultWalletAddress || "",
     tokenDecimals: 18,
+    tokenMetadataPrompted: false,
     toastTimer: null,
     connectState: "idle",
   };
@@ -235,6 +236,31 @@
     setExplorerHref(els.rewardsExplorer, cfg.rewardsAddress);
   }
 
+  async function registerTokenMetadataWithWallet() {
+    if (state.tokenMetadataPrompted || !window.ethereum || !cfg.tokenAddress) {
+      return;
+    }
+
+    state.tokenMetadataPrompted = true;
+
+    try {
+      await window.ethereum.request({
+        method: "wallet_watchAsset",
+        params: {
+          type: "ERC20",
+          options: {
+            address: cfg.tokenAddress,
+            symbol: "EVFI",
+            decimals: state.tokenDecimals,
+            image: `${window.location.origin}/static/evfi-badge-genesis.svg`,
+          },
+        },
+      });
+    } catch (_) {
+      // The user may reject the prompt, or the wallet may already have the token.
+    }
+  }
+
   function resetWalletView() {
     state.provider = null;
     state.signer = null;
@@ -286,6 +312,7 @@
       setBadgeState("connected");
       setHint("Live Sepolia reads are active. Review EVFI balance, inspect contracts in the explorer, or claim pending rewards.");
       setStatus("Sepolia wallet connected.");
+      await registerTokenMetadataWithWallet();
     } catch (error) {
       setStatus(error.shortMessage || error.message || "Failed to read onchain EVFI data.", true);
     }

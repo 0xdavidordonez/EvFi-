@@ -389,11 +389,13 @@ BASE_CSS = """
     }
 
     .hero-auth{
-        min-height:300px;
-        align-items:stretch;
+        min-height:320px;
+        align-items:flex-end;
+        justify-content:space-between;
+        gap:22px;
         background:
-            linear-gradient(112deg, rgba(4,9,22,.95) 0%, rgba(6,13,29,.9) 46%, rgba(8,14,28,.38) 100%),
-            url('/static/EVFi-banner-dark.png') right center / cover no-repeat;
+            linear-gradient(108deg, rgba(3,7,18,.92) 0%, rgba(4,11,24,.88) 42%, rgba(4,10,20,.24) 100%),
+            url('/static/EVFi-banner-dark.png') right 35% center / cover no-repeat;
         border-color:rgba(110,188,255,.28);
         box-shadow:0 26px 80px rgba(2,7,20,.62);
     }
@@ -403,16 +405,22 @@ BASE_CSS = """
         position:absolute;
         inset:0;
         background:
-            radial-gradient(circle at 10% 12%, rgba(123,45,255,.26), transparent 42%),
-            radial-gradient(circle at 20% 82%, rgba(0,200,255,.2), transparent 48%);
+            radial-gradient(circle at 8% 10%, rgba(123,45,255,.34), transparent 44%),
+            radial-gradient(circle at 26% 84%, rgba(0,200,255,.22), transparent 50%),
+            linear-gradient(180deg, rgba(2,6,15,.2), rgba(2,6,15,.62));
         pointer-events:none;
     }
 
     .hero-auth-copy{
         position:relative;
         z-index:1;
-        max-width:min(640px, 70%);
-        backdrop-filter:blur(1.5px);
+        max-width:min(640px, 72%);
+        padding:22px 24px;
+        border-radius:18px;
+        background:linear-gradient(180deg, rgba(7,13,28,.82), rgba(6,11,23,.66));
+        border:1px solid rgba(127,180,255,.24);
+        box-shadow:0 18px 36px rgba(1,5,15,.42);
+        backdrop-filter:blur(4px);
     }
 
     .hero-auth-actions{
@@ -422,6 +430,18 @@ BASE_CSS = """
         align-items:flex-end;
         justify-content:flex-end;
         min-width:220px;
+    }
+
+    .hero-auth h1{
+        font-size:52px;
+        line-height:.98;
+        letter-spacing:-.04em;
+    }
+
+    .hero-auth p{
+        margin-top:14px;
+        max-width:56ch;
+        color:#b9c7da;
     }
 
     .hero h1{
@@ -478,6 +498,12 @@ BASE_CSS = """
     .btn-primary{
         background:linear-gradient(180deg, #ff2d46, #dd1b38);
         box-shadow:0 8px 0 rgba(120, 10, 30, .9), 0 18px 30px rgba(0,0,0,.3);
+    }
+
+    .hero-auth .btn-primary{
+        min-width:210px;
+        padding:15px 24px;
+        border-color:rgba(255,255,255,.16);
     }
 
     .btn-primary:active{
@@ -1881,8 +1907,8 @@ BASE_CSS = """
         }
 
         .hero-auth{
-            min-height:320px;
-            background-position:75% center;
+            min-height:340px;
+            background-position:68% center;
         }
 
         .hero-auth-copy{
@@ -1954,9 +1980,22 @@ BASE_CSS = """
         }
 
         .hero-auth{
-            min-height:360px;
-            background-position:72% center;
+            min-height:390px;
+            background-position:60% center;
             padding:24px;
+        }
+
+        .hero-auth h1{
+            font-size:42px;
+        }
+
+        .hero-auth p{
+            font-size:16px;
+            line-height:1.55;
+        }
+
+        .hero-auth-copy{
+            padding:18px 18px 20px;
         }
     }
 </style>

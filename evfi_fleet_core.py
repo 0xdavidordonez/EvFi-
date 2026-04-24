@@ -58,7 +58,10 @@ EVFI_MIN_ASSIGNMENT = float(os.getenv("EVFI_MIN_ASSIGNMENT", "5"))
 MINIMUM_TRIP_DISTANCE = 2.0
 MINIMUM_TRIP_DURATION_SECONDS = 5 * 60
 MINIMUM_AVERAGE_SPEED = 12.0
+MAX_AVERAGE_SPEED = 95.0
 MAX_DAILY_MILES = 300.0
+DUPLICATE_SYNC_WINDOW_SECONDS = 10 * 60
+MIN_SYNC_INTERVAL_SECONDS = 60
 SPORT_MODE_DURATION_SECONDS = 15 * 60
 SPORT_MODE_USES_PER_DAY = 1
 SPORT_MODE_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -70,14 +73,17 @@ CHALLENGE_DEFS = {
     "drive_25_miles_weekly": {
         "label": "Drive 25 Miles This Week",
         "target": CHALLENGE_TARGET_DRIVE_25,
+        "window": "weekly",
     },
     "sync_3_days_in_a_row": {
         "label": "Sync 3 Days In A Row",
         "target": CHALLENGE_TARGET_SYNC_3_DAY_STREAK,
+        "window": "weekly",
     },
     "earn_250_evfi": {
         "label": "Earn 250 EVFI",
         "target": CHALLENGE_TARGET_EARN_250_EVFI,
+        "window": "monthly",
     },
 }
 
@@ -132,6 +138,24 @@ def parse_calendar_day(value):
         return datetime.strptime(str(value), "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def challenge_window_bounds(window_type, ts=None):
+    current_ts = int(ts or now_ts())
+    current = datetime.fromtimestamp(current_ts)
+    if window_type == "weekly":
+        start, end = current_week_bounds(current_ts)
+        return ("weekly", start, end, f"week:{start}")
+    if window_type == "monthly":
+        month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if month_start.month == 12:
+            next_month = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month = month_start.replace(month=month_start.month + 1)
+        month_end = int(next_month.timestamp()) - 1
+        start = int(month_start.timestamp())
+        return ("monthly", start, month_end, f"month:{month_start.year:04d}-{month_start.month:02d}")
+    return ("all_time", 0, 4102444799, "all_time")
 
 
 def fmt2(value):
@@ -324,6 +348,24 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_challenge_windows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        challenge_key TEXT,
+        window_key TEXT,
+        window_start INTEGER,
+        window_end INTEGER,
+        progress REAL DEFAULT 0,
+        target REAL DEFAULT 0,
+        completed INTEGER DEFAULT 0,
+        completed_at INTEGER,
+        active INTEGER DEFAULT 1,
+        last_updated INTEGER,
+        UNIQUE(user_id, challenge_key, window_key)
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS gamification_badges (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -360,6 +402,17 @@ def init_db():
         charging_state TEXT,
         charge_rate REAL,
         efficiency_whmi REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_activity_feed (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        event_type TEXT,
+        source TEXT,
+        details_json TEXT,
+        created_at INTEGER
     )
     """)
 
@@ -1954,6 +2007,65 @@ BASE_CSS = """
         min-height:520px;
     }
 
+    .activity-panel{
+        margin-top:16px;
+        padding:24px;
+    }
+
+    .activity-list{
+        display:grid;
+        gap:10px;
+        margin-top:14px;
+    }
+
+    .activity-item{
+        display:grid;
+        gap:6px;
+        padding:12px 14px;
+        border-radius:14px;
+        border:1px solid rgba(255,255,255,.08);
+        background:rgba(255,255,255,.03);
+    }
+
+    .activity-head{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+    }
+
+    .activity-type{
+        font-family:'Oxanium', sans-serif;
+        font-size:15px;
+        color:#f4f7fc;
+    }
+
+    .activity-time{
+        color:#a8b5c9;
+        font-size:12px;
+        white-space:nowrap;
+    }
+
+    .activity-source{
+        display:inline-flex;
+        width:max-content;
+        border-radius:999px;
+        padding:4px 10px;
+        font-size:11px;
+        letter-spacing:.06em;
+        text-transform:uppercase;
+        color:#c8d7ef;
+        background:rgba(105,167,255,.12);
+        border:1px solid rgba(105,167,255,.26);
+    }
+
+    .activity-details{
+        color:#d3dced;
+        font-size:13px;
+        line-height:1.45;
+        word-break:break-word;
+    }
+
     .history-title{
         margin:0 0 18px;
         font-size:20px;
@@ -2287,6 +2399,22 @@ def get_or_create_gamification_state(user_id):
     return state
 
 
+def append_gamification_activity(user_id, event_type, source, details=None, event_ts=None):
+    payload = details or {}
+    created_at = int(event_ts or now_ts())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO gamification_activity_feed (user_id, event_type, source, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, str(event_type), str(source), json.dumps(payload, sort_keys=True, default=str), created_at),
+    )
+    conn.commit()
+    conn.close()
+
+
 def updateStreak(user_id, activity_date):
     state = get_or_create_gamification_state(user_id)
     last_date = parse_calendar_day(state["last_activity_date"])
@@ -2353,9 +2481,29 @@ def updateDailyActivity(user_id, activityDate=None, activity_type="activity"):
 
     events = []
     if streak["streakIncreased"]:
-        events.append(f"Streak is now {streak['currentStreak']} day{'s' if streak['currentStreak'] != 1 else ''}.")
+        message = f"Streak is now {streak['currentStreak']} day{'s' if streak['currentStreak'] != 1 else ''}."
+        events.append(message)
+        append_gamification_activity(
+            user_id,
+            "streak_increased",
+            activity_type,
+            {"currentStreak": streak["currentStreak"], "longestStreak": streak["longestStreak"], "activityDate": day},
+        )
     if streak["streakReset"]:
-        events.append("Streak reset after a missed day.")
+        message = "Streak reset after a missed day."
+        events.append(message)
+        append_gamification_activity(
+            user_id,
+            "streak_reset",
+            activity_type,
+            {"currentStreak": streak["currentStreak"], "activityDate": day},
+        )
+    append_gamification_activity(
+        user_id,
+        "daily_activity",
+        activity_type,
+        {"activityDate": day, "streak": streak["currentStreak"]},
+    )
     return {"activityDate": day, "streak": streak, "events": events}
 
 
@@ -2368,6 +2516,8 @@ def record_app_activity(user_id, activity_type, activity_ts=None):
     events.extend(activity["events"])
     events.extend(challenges["events"])
     events.extend(badges["events"])
+    # Keep response events concise and unique in order.
+    events = list(dict.fromkeys(events))
     return {
         "activity": activity,
         "challenges": challenges,
@@ -2416,7 +2566,8 @@ def record_evfi_earning(user_id, event_key, amount, source):
             (source, event_amount, now_ts(), user_id, event_key),
         )
 
-    if abs(delta) > 0:
+    should_log_event = abs(delta) > 0
+    if should_log_event:
         cur.execute(
             """
             UPDATE gamification_state
@@ -2428,6 +2579,13 @@ def record_evfi_earning(user_id, event_key, amount, source):
         )
     conn.commit()
     conn.close()
+    if should_log_event:
+        append_gamification_activity(
+            user_id,
+            "evfi_earned",
+            source,
+            {"eventKey": event_key, "delta": delta, "totalEventAmount": event_amount},
+        )
     return delta
 
 
@@ -2435,12 +2593,27 @@ def upsert_challenge(user_id, challenge_key, progress):
     definition = CHALLENGE_DEFS[challenge_key]
     target = float(definition["target"])
     next_progress = max(0.0, min(float(progress or 0.0), target))
+    window_type = definition.get("window", "all_time")
+    _, window_start, window_end, window_key = challenge_window_bounds(window_type)
 
     conn = get_db_connection()
     cur = conn.cursor()
+    # Archive prior active windows for this challenge if they are not current.
     cur.execute(
-        "SELECT completed, progress FROM gamification_challenges WHERE user_id = ? AND challenge_key = ?",
-        (user_id, challenge_key),
+        """
+        UPDATE gamification_challenge_windows
+        SET active = 0, last_updated = ?
+        WHERE user_id = ? AND challenge_key = ? AND active = 1 AND window_key != ?
+        """,
+        (now_ts(), user_id, challenge_key, window_key),
+    )
+    cur.execute(
+        """
+        SELECT completed, progress
+        FROM gamification_challenge_windows
+        WHERE user_id = ? AND challenge_key = ? AND window_key = ?
+        """,
+        (user_id, challenge_key, window_key),
     )
     row = cur.fetchone()
     was_completed = bool(row["completed"]) if row else False
@@ -2449,18 +2622,48 @@ def upsert_challenge(user_id, challenge_key, progress):
 
     cur.execute(
         """
+        INSERT INTO gamification_challenge_windows
+        (user_id, challenge_key, window_key, window_start, window_end, progress, target, completed, completed_at, active, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(user_id, challenge_key, window_key) DO UPDATE SET
+            window_start = excluded.window_start,
+            window_end = excluded.window_end,
+            progress = excluded.progress,
+            target = excluded.target,
+            completed = CASE WHEN gamification_challenge_windows.completed = 1 THEN 1 ELSE excluded.completed END,
+            completed_at = CASE
+                WHEN gamification_challenge_windows.completed = 1 THEN gamification_challenge_windows.completed_at
+                WHEN excluded.completed = 1 THEN excluded.completed_at
+                ELSE gamification_challenge_windows.completed_at
+            END,
+            active = 1,
+            last_updated = excluded.last_updated
+        """,
+        (
+            user_id,
+            challenge_key,
+            window_key,
+            window_start,
+            window_end,
+            next_progress,
+            target,
+            1 if is_completed else 0,
+            completed_at,
+            now_ts(),
+        ),
+    )
+
+    # Mirror active window into legacy table used by existing dashboard hooks.
+    cur.execute(
+        """
         INSERT INTO gamification_challenges
         (user_id, challenge_key, progress, target, completed, completed_at, last_updated)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, challenge_key) DO UPDATE SET
             progress = excluded.progress,
             target = excluded.target,
-            completed = CASE WHEN gamification_challenges.completed = 1 THEN 1 ELSE excluded.completed END,
-            completed_at = CASE
-                WHEN gamification_challenges.completed = 1 THEN gamification_challenges.completed_at
-                WHEN excluded.completed = 1 THEN excluded.completed_at
-                ELSE gamification_challenges.completed_at
-            END,
+            completed = excluded.completed,
+            completed_at = excluded.completed_at,
             last_updated = excluded.last_updated
         """,
         (user_id, challenge_key, next_progress, target, 1 if is_completed else 0, completed_at, now_ts()),
@@ -2469,16 +2672,23 @@ def upsert_challenge(user_id, challenge_key, progress):
     conn.close()
     return {
         "challengeKey": challenge_key,
+        "windowKey": window_key,
+        "windowStart": window_start,
+        "windowEnd": window_end,
         "progress": next_progress,
         "target": target,
         "completedNow": is_completed and not was_completed,
-        "completed": is_completed or was_completed,
+        "completed": is_completed,
     }
 
 
 def updateChallengeProgress(user_id, telemetryDelta):
+    ensure_challenge_windows_maintenance(user_id)
     state = get_or_create_gamification_state(user_id)
     week_start, week_end = current_week_bounds()
+    month_start_key = challenge_window_bounds("monthly")
+    month_start = month_start_key[1]
+    month_end = month_start_key[2]
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2492,22 +2702,76 @@ def updateChallengeProgress(user_id, telemetryDelta):
         (user_id, week_start, week_end),
     )
     weekly_miles = float(cur.fetchone()["miles"] or 0.0)
-    cur.execute("SELECT COALESCE(SUM(amount), 0) AS earned FROM gamification_evfi_events WHERE user_id = ?", (user_id,))
-    lifetime_earned = float(cur.fetchone()["earned"] or 0.0)
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS earned
+        FROM gamification_evfi_events
+        WHERE user_id = ? AND updated_at BETWEEN ? AND ?
+        """,
+        (user_id, month_start, month_end),
+    )
+    monthly_earned = float(cur.fetchone()["earned"] or 0.0)
     conn.close()
 
     challenge_updates = [
         upsert_challenge(user_id, "drive_25_miles_weekly", weekly_miles),
         upsert_challenge(user_id, "sync_3_days_in_a_row", min(float(state["current_streak"] or 0), CHALLENGE_TARGET_SYNC_3_DAY_STREAK)),
-        upsert_challenge(user_id, "earn_250_evfi", lifetime_earned),
+        upsert_challenge(user_id, "earn_250_evfi", monthly_earned),
     ]
 
     newly_completed = [item for item in challenge_updates if item["completedNow"]]
+    for item in challenge_updates:
+        append_gamification_activity(
+            user_id,
+            "challenge_progress",
+            "challenge_engine",
+            {
+                "challengeKey": item["challengeKey"],
+                "windowKey": item.get("windowKey"),
+                "progress": item["progress"],
+                "target": item["target"],
+                "completed": item["completed"],
+            },
+        )
+    for item in newly_completed:
+        append_gamification_activity(
+            user_id,
+            "challenge_completed",
+            "challenge_engine",
+            {"challengeKey": item["challengeKey"], "windowKey": item.get("windowKey")},
+        )
     return {
         "all": challenge_updates,
         "completedNow": newly_completed,
         "events": [f"Challenge completed: {CHALLENGE_DEFS[item['challengeKey']]['label']}" for item in newly_completed],
     }
+
+
+def ensure_challenge_windows_maintenance(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    archived_count = 0
+    for challenge_key, definition in CHALLENGE_DEFS.items():
+        window_type = definition.get("window", "all_time")
+        _, _, _, expected_window_key = challenge_window_bounds(window_type)
+        cur.execute(
+            """
+            UPDATE gamification_challenge_windows
+            SET active = 0, last_updated = ?
+            WHERE user_id = ? AND challenge_key = ? AND active = 1 AND window_key != ?
+            """,
+            (now_ts(), user_id, challenge_key, expected_window_key),
+        )
+        archived_count += int(cur.rowcount or 0)
+    conn.commit()
+    conn.close()
+    if archived_count > 0:
+        append_gamification_activity(
+            user_id,
+            "challenge_window_rollover",
+            "challenge_engine",
+            {"archivedWindows": archived_count},
+        )
 
 
 def awardEligibleBadges(user_id):
@@ -2549,7 +2813,7 @@ def awardEligibleBadges(user_id):
             """
             UPDATE gamification_state
             SET completed_challenges_count = (
-                SELECT COUNT(*) FROM gamification_challenges WHERE user_id = ? AND completed = 1
+                SELECT COUNT(*) FROM gamification_challenge_windows WHERE user_id = ? AND active = 1 AND completed = 1
             ),
                 updated_at = ?
             WHERE user_id = ?
@@ -2558,6 +2822,13 @@ def awardEligibleBadges(user_id):
         )
     conn.commit()
     conn.close()
+    for badge in awarded_now:
+        append_gamification_activity(
+            user_id,
+            "badge_awarded",
+            "badge_engine",
+            {"badgeKey": badge["badgeKey"], "badgeName": badge["badgeName"]},
+        )
     return {
         "awardedNow": awarded_now,
         "events": [f"Badge earned: {item['badgeName']}" for item in awarded_now],
@@ -2617,6 +2888,22 @@ def processTelemetrySync(user_id, telemetryData):
     )
     conn.commit()
     conn.close()
+    append_gamification_activity(
+        user_id,
+        "telemetry_sync",
+        "telemetry",
+        {
+            "synced_at": synced_at,
+            "odometer": odometer,
+            "miles_delta": miles_delta,
+            "verified_miles": verified_miles,
+            "battery_level": battery_level,
+            "charging_state": charging_state,
+            "charge_rate": charge_rate,
+            "efficiency_whmi": efficiency_whmi,
+        },
+        event_ts=synced_at,
+    )
 
     challenges = updateChallengeProgress(user_id, {"verified_miles": verified_miles})
     badges = awardEligibleBadges(user_id)
@@ -2640,10 +2927,11 @@ def getGamificationState(user_id):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT challenge_key, progress, target, completed, completed_at
-        FROM gamification_challenges
+        SELECT challenge_key, window_key, window_start, window_end, progress, target, completed, completed_at
+        FROM gamification_challenge_windows
         WHERE user_id = ?
-        ORDER BY challenge_key ASC
+          AND active = 1
+        ORDER BY challenge_key ASC, window_start DESC
         """,
         (user_id,),
     )
@@ -2662,6 +2950,25 @@ def getGamificationState(user_id):
 
     cur.execute(
         """
+        SELECT event_type, source, details_json, created_at
+        FROM gamification_activity_feed
+        WHERE user_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    )
+    feed_rows = []
+    for row in cur.fetchall():
+        row_dict = dict(row)
+        try:
+            row_dict["details"] = json.loads(row_dict.get("details_json") or "{}")
+        except json.JSONDecodeError:
+            row_dict["details"] = {}
+        feed_rows.append(row_dict)
+
+    cur.execute(
+        """
         SELECT synced_at, odometer, miles_delta, verified_miles, battery_level, charging_state, charge_rate, efficiency_whmi
         FROM gamification_sync_history
         WHERE user_id = ?
@@ -2677,6 +2984,7 @@ def getGamificationState(user_id):
         "state": dict(state),
         "challenges": challenges,
         "badges": badges,
+        "activityFeed": feed_rows,
         "telemetrySyncHistory": telemetry_history,
     }
 
@@ -2744,21 +3052,50 @@ def get_daily_verified_miles(user_id, event_vehicle_id, day_start):
     return miles
 
 
+def get_last_reward_event(user_id, event_vehicle_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, odometer_reading, miles_added, synced_at
+        FROM reward_events
+        WHERE user_id = ? AND tesla_vehicle_id = ?
+        ORDER BY synced_at DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id, event_vehicle_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
 def validate_trip_for_scoring(user_id, event_vehicle_id, miles_added, previous_synced_at, synced_at):
     if miles_added <= 0:
         return 0.0
     if miles_added < MINIMUM_TRIP_DISTANCE:
         log_rule_violation("minimum_trip_distance", user_id=user_id, vehicle_id=event_vehicle_id, miles=miles_added)
+        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_trip_distance", "vehicleId": event_vehicle_id, "miles": miles_added})
         return 0.0
 
     duration = synced_at - previous_synced_at if previous_synced_at else MINIMUM_TRIP_DURATION_SECONDS
+    if duration < MIN_SYNC_INTERVAL_SECONDS:
+        log_rule_violation("minimum_sync_interval", user_id=user_id, vehicle_id=event_vehicle_id, duration=duration)
+        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_sync_interval", "vehicleId": event_vehicle_id, "duration": duration})
+        return 0.0
     if duration < MINIMUM_TRIP_DURATION_SECONDS:
         log_rule_violation("minimum_trip_duration", user_id=user_id, vehicle_id=event_vehicle_id, duration=duration)
+        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_trip_duration", "vehicleId": event_vehicle_id, "duration": duration})
         return 0.0
 
     average_speed = miles_added / max(duration / 3600, 0.01)
     if average_speed < MINIMUM_AVERAGE_SPEED:
         log_rule_violation("minimum_average_speed", user_id=user_id, vehicle_id=event_vehicle_id, average_speed=average_speed)
+        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_average_speed", "vehicleId": event_vehicle_id, "average_speed": round(average_speed, 2)})
+        return 0.0
+    if average_speed > MAX_AVERAGE_SPEED:
+        log_rule_violation("max_average_speed", user_id=user_id, vehicle_id=event_vehicle_id, average_speed=average_speed)
+        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "max_average_speed", "vehicleId": event_vehicle_id, "average_speed": round(average_speed, 2)})
         return 0.0
 
     day_start = current_week_bounds(synced_at)[0] + ((datetime.fromtimestamp(synced_at).weekday()) * 86400)
@@ -2766,6 +3103,7 @@ def validate_trip_for_scoring(user_id, event_vehicle_id, miles_added, previous_s
     remaining = max(0.0, MAX_DAILY_MILES - counted_today)
     if miles_added > remaining:
         log_rule_violation("max_daily_miles", user_id=user_id, vehicle_id=event_vehicle_id, miles=miles_added, remaining=remaining)
+        append_gamification_activity(user_id, "telemetry_capped", "anti_abuse", {"reason": "max_daily_miles", "vehicleId": event_vehicle_id, "miles": miles_added, "remaining": remaining})
     return min(miles_added, remaining)
 
 
@@ -3030,15 +3368,20 @@ def get_user_missions(user_id):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT challenge_key, progress, target, completed, completed_at
-        FROM gamification_challenges
+        SELECT challenge_key, window_key, window_start, window_end, progress, target, completed, completed_at
+        FROM gamification_challenge_windows
         WHERE user_id = ?
-        ORDER BY challenge_key ASC
+          AND active = 1
+        ORDER BY challenge_key ASC, window_start DESC
         """,
         (user_id,),
     )
     rows = cur.fetchall()
-    row_map = {row["challenge_key"]: row for row in rows}
+    row_map = {}
+    for row in rows:
+        key = row["challenge_key"]
+        if key not in row_map:
+            row_map[key] = row
     ordered_keys = [
         "drive_25_miles_weekly",
         "sync_3_days_in_a_row",
@@ -3409,6 +3752,7 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
 
     now_ts = int(time.time())
 
+    should_process_telemetry = True
     if existing is None:
         cur.execute("""
             INSERT INTO vehicle_rewards
@@ -3446,9 +3790,47 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
 
         miles_added = current_odometer - previous_latest
         if miles_added < 0:
+            log_rule_violation(
+                "odometer_regression",
+                user_id=user["id"],
+                vehicle_id=str(vid),
+                previous_odometer=previous_latest,
+                current_odometer=current_odometer,
+            )
+            append_gamification_activity(
+                user["id"],
+                "telemetry_rejected",
+                "anti_abuse",
+                {
+                    "reason": "odometer_regression",
+                    "vehicleId": str(vid),
+                    "previous_odometer": previous_latest,
+                    "current_odometer": current_odometer,
+                },
+            )
             miles_added = 0
+        if miles_added == 0 and (now_ts - previous_synced_at) < DUPLICATE_SYNC_WINDOW_SECONDS:
+            should_process_telemetry = False
+            log_rule_violation(
+                "duplicate_sync_event",
+                user_id=user["id"],
+                vehicle_id=str(vid),
+                odometer=current_odometer,
+                elapsed=(now_ts - previous_synced_at),
+            )
+            append_gamification_activity(
+                user["id"],
+                "telemetry_rejected",
+                "anti_abuse",
+                {
+                    "reason": "duplicate_sync_event",
+                    "vehicleId": str(vid),
+                    "odometer": current_odometer,
+                    "elapsed": (now_ts - previous_synced_at),
+                },
+            )
         miles_delta = float(miles_added)
-        verified_miles = validate_trip_for_scoring(user["id"], str(vid), miles_added, previous_synced_at, now_ts)
+        verified_miles = 0.0 if not should_process_telemetry else validate_trip_for_scoring(user["id"], str(vid), miles_added, previous_synced_at, now_ts)
 
         total_miles = current_odometer - baseline
         if total_miles < 0:
@@ -3475,18 +3857,19 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
             str(vid)
         ))
 
-        cur.execute("""
-            INSERT INTO reward_events
-            (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            user["id"],
-            str(vid),
-            current_odometer,
-            verified_miles,
-            verified_miles,
-            now_ts
-        ))
+        if should_process_telemetry:
+            cur.execute("""
+                INSERT INTO reward_events
+                (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                user["id"],
+                str(vid),
+                current_odometer,
+                verified_miles,
+                verified_miles,
+                now_ts
+            ))
 
     conn.commit()
 
@@ -3496,19 +3879,20 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
     )
     row = cur.fetchone()
     conn.close()
-    processTelemetrySync(
-        user["id"],
-        {
-            "odometer": current_odometer,
-            "miles_delta": miles_delta,
-            "verified_miles": verified_miles,
-            "synced_at": now_ts,
-            "battery_level": (telemetry_data or {}).get("battery_level"),
-            "charging_state": (telemetry_data or {}).get("charging_state"),
-            "charge_rate": (telemetry_data or {}).get("charge_rate"),
-            "efficiency_whmi": (telemetry_data or {}).get("efficiency_whmi"),
-        },
-    )
+    if should_process_telemetry:
+        processTelemetrySync(
+            user["id"],
+            {
+                "odometer": current_odometer,
+                "miles_delta": miles_delta,
+                "verified_miles": verified_miles,
+                "synced_at": now_ts,
+                "battery_level": (telemetry_data or {}).get("battery_level"),
+                "charging_state": (telemetry_data or {}).get("charging_state"),
+                "charge_rate": (telemetry_data or {}).get("charge_rate"),
+                "efficiency_whmi": (telemetry_data or {}).get("efficiency_whmi"),
+            },
+        )
     calculate_weekly_score(user["id"], vin, str(vid))
     ensure_airdrop_claim(user["id"], current_odometer)
     return row
@@ -3834,6 +4218,48 @@ def dashboard(vid):
     if not mission_rows:
         mission_rows = "<div class='sub'>Sync the vehicle to start missions.</div>"
 
+    activity_rows = ""
+    activity_name_map = {
+        "daily_activity": "Daily Activity",
+        "streak_increased": "Streak Increased",
+        "streak_reset": "Streak Reset",
+        "telemetry_sync": "Telemetry Sync",
+        "telemetry_rejected": "Telemetry Rejected",
+        "telemetry_capped": "Telemetry Capped",
+        "challenge_progress": "Challenge Progress",
+        "challenge_completed": "Challenge Completed",
+        "challenge_window_rollover": "Challenge Rollover",
+        "badge_awarded": "Badge Awarded",
+        "evfi_earned": "EVFI Earned",
+    }
+    for event in gamification.get("activityFeed", []):
+        event_type = str(event.get("event_type") or "event")
+        event_label = activity_name_map.get(event_type, event_type.replace("_", " ").title())
+        source = str(event.get("source") or "system")
+        created_at = fmt_ts(event.get("created_at"))
+        details = event.get("details") or {}
+        detail_bits = []
+        for key in ("reason", "challengeKey", "badgeName", "delta", "miles_delta", "verified_miles", "currentStreak"):
+            if key in details and details[key] is not None:
+                detail_bits.append(f"{key}: {details[key]}")
+        if not detail_bits and isinstance(details, dict):
+            for key, value in list(details.items())[:3]:
+                if value is not None:
+                    detail_bits.append(f"{key}: {value}")
+        details_text = escape(" | ".join(str(bit) for bit in detail_bits)) if detail_bits else "No extra details."
+        activity_rows += f"""
+        <div class="activity-item">
+            <div class="activity-head">
+                <div class="activity-type">{escape(event_label)}</div>
+                <div class="activity-time">{escape(created_at)}</div>
+            </div>
+            <div class="activity-source">{escape(source)}</div>
+            <div class="activity-details">{details_text}</div>
+        </div>
+        """
+    if not activity_rows:
+        activity_rows = "<div class='sub'>No gamification activity yet.</div>"
+
     body = f"""
     <section class="topbar">
         <section class="vehicle-panel">
@@ -4090,6 +4516,13 @@ def dashboard(vid):
                 <tr><th>EvFiRewards</th><td>{escape(EVFI_REWARDS_ADDRESS or "Not configured")}</td></tr>
             </table>
         </section>
+    </section>
+
+    <section class="panel activity-panel">
+        <h3 class="history-title">Gamification Activity</h3>
+        <div class="activity-list">
+            {activity_rows}
+        </div>
     </section>
     """
     return render_page(f"{display_name} Dashboard", body)

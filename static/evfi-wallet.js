@@ -23,6 +23,13 @@
     sportModeStatus: document.getElementById("sportModeStatus"),
     adminKey: document.getElementById("adminKeyInput"),
     distributionRecipient: document.getElementById("distributionRecipientInput"),
+    currentStreakValue: document.getElementById("currentStreakValue"),
+    longestStreakValue: document.getElementById("longestStreakValue"),
+    streakUpdatedAt: document.getElementById("streakUpdatedAt"),
+    challengeCompletedCount: document.getElementById("challengeCompletedCount"),
+    challengeTotalCount: document.getElementById("challengeTotalCount"),
+    missionsUpdatedAt: document.getElementById("missionsUpdatedAt"),
+    missionList: document.getElementById("missionList"),
   };
 
   if (!els.connect) {
@@ -142,6 +149,112 @@
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     });
+  }
+
+  function formatInteger(value) {
+    return Number(value || 0).toLocaleString(undefined, {
+      maximumFractionDigits: 0,
+    });
+  }
+
+  function formatTimestamp(value) {
+    if (!value) {
+      return "Never";
+    }
+    const date = new Date(Number(value) * 1000);
+    if (Number.isNaN(date.getTime())) {
+      return "Never";
+    }
+    return date.toLocaleString(undefined, {
+      month: "short",
+      day: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function missionLabelFor(challengeKey) {
+    const labels = {
+      drive_25_miles_weekly: "Drive 25 Miles This Week",
+      sync_3_days_in_a_row: "Sync 3 Days In A Row",
+      earn_250_evfi: "Earn 250 EVFI",
+    };
+    return labels[challengeKey] || String(challengeKey || "Mission");
+  }
+
+  function renderMissionRows(challenges) {
+    if (!els.missionList || !Array.isArray(challenges)) {
+      return;
+    }
+
+    const rows = challenges
+      .slice()
+      .sort((a, b) => String(a.challenge_key || "").localeCompare(String(b.challenge_key || "")))
+      .map((challenge) => {
+        const progress = Number(challenge.progress || 0);
+        const target = Number(challenge.target || 0);
+        const completionPct = target > 0 ? Math.min(100, (progress / target) * 100) : 0;
+        const completed = Boolean(challenge.completed);
+        return `
+          <div class="mission-row">
+            <div class="mission-copy">
+              ${completed ? '<img class="mission-badge" src="/static/evfi-token-logo.png" alt="Completed mission badge">' : ""}
+              <div>
+                <strong>${missionLabelFor(challenge.challenge_key)}</strong>
+                <div class="sub">Progress: <span class="value-tone-positive">${formatNumber(completionPct)}%</span></div>
+              </div>
+            </div>
+            <span class="mission-pill" data-state="${completed ? "complete" : "active"}">${completed ? "Complete" : "Active"}</span>
+          </div>
+        `;
+      })
+      .join("");
+
+    els.missionList.innerHTML = rows || "<div class='sub'>Sync the vehicle to start missions.</div>";
+  }
+
+  function applyGamificationState(gamification) {
+    if (!gamification || !gamification.state) {
+      return;
+    }
+    const stateData = gamification.state;
+    const challenges = Array.isArray(gamification.challenges) ? gamification.challenges : [];
+    const completedChallenges = challenges.filter((challenge) => Boolean(challenge.completed)).length;
+
+    if (els.currentStreakValue) {
+      els.currentStreakValue.textContent = formatInteger(stateData.current_streak || 0);
+    }
+    if (els.longestStreakValue) {
+      els.longestStreakValue.textContent = formatInteger(stateData.longest_streak || 0);
+    }
+    if (els.streakUpdatedAt) {
+      els.streakUpdatedAt.textContent = `Updated ${formatTimestamp(stateData.updated_at)}`;
+    }
+    if (els.challengeCompletedCount) {
+      els.challengeCompletedCount.textContent = formatInteger(completedChallenges);
+    }
+    if (els.challengeTotalCount) {
+      els.challengeTotalCount.textContent = formatInteger(challenges.length);
+    }
+    if (els.missionsUpdatedAt) {
+      els.missionsUpdatedAt.textContent = `Updated ${formatTimestamp(stateData.updated_at)}`;
+    }
+    renderMissionRows(challenges);
+  }
+
+  function emitGamificationMessages(events) {
+    if (!Array.isArray(events) || events.length === 0) {
+      return;
+    }
+    const messages = events.filter(Boolean).map((item) => String(item).trim()).filter(Boolean);
+    if (messages.length === 0) {
+      return;
+    }
+    showToast(messages[0], "success");
+    if (messages.length > 1) {
+      setHint(messages.join(" "));
+    }
   }
 
   function updateWalletAddress(value) {
@@ -426,6 +539,8 @@
         setHint(`Pending EVFI assigned to ${payload.wallet}. Track the assignment tx on Sepolia: ${payload.txHash}`);
       }
       showToast("Demo EVFI assigned.", "success");
+      applyGamificationState(payload.gamification);
+      emitGamificationMessages(payload.gamificationEvents);
       await refreshChainData();
     } catch (error) {
       setStatus(error.message || "Reward assignment failed.", true);
@@ -488,6 +603,8 @@
       setHint(`Assigned ${formatNumber(payload.amountTokens)} EVFI to ${payload.wallet}. ${payload.txHash ? `Sepolia tx: ${payload.txHash}. ` : ""}Claim from that wallet to verify the end-to-end token flow.`);
       showToast("EVFI tokens successfully airdropped.", "success");
       console.log("Transaction confirmed");
+      applyGamificationState(payload.gamification);
+      emitGamificationMessages(payload.gamificationEvents);
       await refreshChainData();
       updateMockTokenMetrics();
     } catch (error) {
@@ -544,6 +661,8 @@
       setStatus(`Airdrop Claimed: ${formatNumber(payload.amountTokens)} EVFI`);
       setHint(payload.txHash ? `Airdrop mint confirmed on Sepolia: ${payload.txHash}` : "Airdrop already claimed.");
       showToast("Airdrop Claimed.", "success");
+      applyGamificationState(payload.gamification);
+      emitGamificationMessages(payload.gamificationEvents);
       await refreshChainData();
     } catch (error) {
       setStatus(error.message || "Airdrop claim failed.", true);

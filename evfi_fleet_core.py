@@ -62,6 +62,32 @@ MAX_DAILY_MILES = 300.0
 SPORT_MODE_DURATION_SECONDS = 15 * 60
 SPORT_MODE_USES_PER_DAY = 1
 SPORT_MODE_COOLDOWN_SECONDS = 24 * 60 * 60
+CHALLENGE_TARGET_DRIVE_25 = 25.0
+CHALLENGE_TARGET_SYNC_3_DAY_STREAK = 3.0
+CHALLENGE_TARGET_EARN_250_EVFI = 250.0
+
+CHALLENGE_DEFS = {
+    "drive_25_miles_weekly": {
+        "label": "Drive 25 Miles This Week",
+        "target": CHALLENGE_TARGET_DRIVE_25,
+    },
+    "sync_3_days_in_a_row": {
+        "label": "Sync 3 Days In A Row",
+        "target": CHALLENGE_TARGET_SYNC_3_DAY_STREAK,
+    },
+    "earn_250_evfi": {
+        "label": "Earn 250 EVFI",
+        "target": CHALLENGE_TARGET_EARN_250_EVFI,
+    },
+}
+
+BADGE_DEFS = {
+    "first_sync": "First Sync Badge",
+    "streak_7_days": "7-Day Streak Badge",
+    "miles_100": "100 Miles Synced Badge",
+    "miles_500": "500 Miles Synced Badge",
+    "first_evfi_claim": "First EVFI Claim Badge",
+}
 
 STATE = secrets.token_urlsafe(32)
 LEGACY_DB_PATH = "drivetoken.db"
@@ -93,6 +119,19 @@ def current_week_bounds(ts=None):
     week_start_dt = week_start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     week_end_dt = week_start_dt + timedelta(days=7) - timedelta(seconds=1)
     return int(week_start_dt.timestamp()), int(week_end_dt.timestamp())
+
+
+def calendar_day(ts=None):
+    return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d")
+
+
+def parse_calendar_day(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def fmt2(value):
@@ -148,6 +187,7 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reward_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
         tesla_vehicle_id TEXT,
         odometer_reading REAL,
         miles_added REAL,
@@ -155,6 +195,11 @@ def init_db():
         synced_at INTEGER
     )
     """)
+
+    try:
+        cur.execute("ALTER TABLE reward_events ADD COLUMN user_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -241,6 +286,80 @@ def init_db():
         week_start INTEGER,
         reset_at INTEGER,
         UNIQUE(user_id, week_start)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_state (
+        user_id INTEGER PRIMARY KEY,
+        last_activity_date TEXT,
+        last_login_date TEXT,
+        last_sync_date TEXT,
+        last_reward_check_date TEXT,
+        current_streak INTEGER DEFAULT 0,
+        longest_streak INTEGER DEFAULT 0,
+        completed_challenges_count INTEGER DEFAULT 0,
+        total_miles_synced REAL DEFAULT 0,
+        lifetime_evfi_earned REAL DEFAULT 0,
+        last_known_odometer REAL,
+        total_sync_events INTEGER DEFAULT 0,
+        telemetry_sync_count INTEGER DEFAULT 0,
+        last_sync_at INTEGER,
+        updated_at INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_challenges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        challenge_key TEXT,
+        progress REAL DEFAULT 0,
+        target REAL DEFAULT 0,
+        completed INTEGER DEFAULT 0,
+        completed_at INTEGER,
+        last_updated INTEGER,
+        UNIQUE(user_id, challenge_key)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_badges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        badge_key TEXT,
+        badge_name TEXT,
+        badge_asset TEXT,
+        awarded_at INTEGER,
+        UNIQUE(user_id, badge_key)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_evfi_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        event_key TEXT,
+        source TEXT,
+        amount REAL DEFAULT 0,
+        created_at INTEGER,
+        updated_at INTEGER,
+        UNIQUE(user_id, event_key)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gamification_sync_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        synced_at INTEGER,
+        odometer REAL,
+        miles_delta REAL DEFAULT 0,
+        verified_miles REAL DEFAULT 0,
+        battery_level REAL,
+        charging_state TEXT,
+        charge_rate REAL,
+        efficiency_whmi REAL
     )
     """)
 
@@ -389,13 +508,14 @@ BASE_CSS = """
     }
 
     .hero-auth{
-        min-height:320px;
-        align-items:flex-end;
-        justify-content:space-between;
-        gap:22px;
+        min-height:176px;
+        align-items:center;
+        justify-content:flex-end;
+        gap:0;
+        margin-bottom:14px;
         background:
             linear-gradient(108deg, rgba(3,7,18,.92) 0%, rgba(4,11,24,.88) 42%, rgba(4,10,20,.24) 100%),
-            url('/static/EVFi-banner-dark.png') right 35% center / cover no-repeat;
+            url('/static/EVFi-banner-dark.png') center center / cover no-repeat;
         border-color:rgba(110,188,255,.28);
         box-shadow:0 26px 80px rgba(2,7,20,.62);
     }
@@ -411,34 +531,47 @@ BASE_CSS = """
         pointer-events:none;
     }
 
-    .hero-auth-copy{
-        position:relative;
-        z-index:1;
-        max-width:min(640px, 72%);
-        padding:22px 24px;
-        border-radius:18px;
-        background:linear-gradient(180deg, rgba(7,13,28,.82), rgba(6,11,23,.66));
-        border:1px solid rgba(127,180,255,.24);
-        box-shadow:0 18px 36px rgba(1,5,15,.42);
-        backdrop-filter:blur(4px);
+    .hero-auth::after{
+        content:"";
+        position:absolute;
+        inset:0;
+        background:
+            linear-gradient(90deg, rgba(3,8,18,.34) 0%, rgba(3,8,18,.16) 34%, rgba(3,8,18,.22) 72%, rgba(3,8,18,.5) 100%),
+            linear-gradient(180deg, rgba(2,6,16,.18), rgba(2,6,16,.48));
+        pointer-events:none;
     }
 
-    .hero-auth-actions{
+    .pre-auth-info{
+        min-height:220px;
+        align-items:flex-end;
+        justify-content:space-between;
+        gap:20px;
+        background:linear-gradient(180deg, rgba(16,20,31,.95), rgba(12,16,26,.98));
+        border-color:rgba(127,180,255,.24);
+        box-shadow:0 20px 48px rgba(2,8,20,.46);
+    }
+
+    .pre-auth-copy{
         position:relative;
         z-index:1;
+        max-width:760px;
+    }
+
+    .pre-auth-actions{
         display:flex;
-        align-items:flex-end;
+        align-items:center;
         justify-content:flex-end;
         min-width:220px;
     }
 
-    .hero-auth h1{
-        font-size:52px;
+    .pre-auth-info h1{
+        margin:0;
+        font-size:50px;
         line-height:.98;
-        letter-spacing:-.04em;
+        letter-spacing:-.035em;
     }
 
-    .hero-auth p{
+    .pre-auth-info p{
         margin-top:14px;
         max-width:56ch;
         color:#b9c7da;
@@ -496,24 +629,44 @@ BASE_CSS = """
     }
 
     .btn-primary{
-        background:linear-gradient(180deg, #ff2d46, #dd1b38);
-        box-shadow:0 8px 0 rgba(120, 10, 30, .9), 0 18px 30px rgba(0,0,0,.3);
-    }
-
-    .hero-auth .btn-primary{
-        min-width:210px;
-        padding:15px 24px;
-        border-color:rgba(255,255,255,.16);
+        color:#06111f;
+        background:linear-gradient(135deg, #1fe37c 0%, #44d9ff 100%);
+        border-color:rgba(127,238,255,.56);
+        box-shadow:
+            0 8px 0 rgba(8, 70, 96, .95),
+            0 16px 28px rgba(1, 10, 24, .42),
+            inset 0 1px 0 rgba(255,255,255,.48);
     }
 
     .btn-primary:active{
         transform:translateY(4px);
-        box-shadow:0 3px 0 rgba(120, 10, 30, .9), 0 10px 18px rgba(0,0,0,.28);
+        box-shadow:
+            0 3px 0 rgba(8, 70, 96, .95),
+            0 8px 16px rgba(1, 10, 24, .34),
+            inset 0 1px 0 rgba(255,255,255,.38);
     }
 
     .btn-secondary{
-        background:rgba(255,255,255,.04);
-        box-shadow:0 8px 20px rgba(0,0,0,.18);
+        color:#d8e8ff;
+        border-color:rgba(110,188,255,.3);
+        background:linear-gradient(180deg, rgba(20,31,52,.78), rgba(12,20,36,.82));
+        box-shadow:
+            0 8px 0 rgba(12, 20, 36, .95),
+            0 16px 28px rgba(2, 9, 20, .36),
+            inset 0 1px 0 rgba(170, 220, 255, .1);
+    }
+
+    .btn-secondary:hover{
+        border-color:rgba(138,212,255,.52);
+        background:linear-gradient(180deg, rgba(26,41,67,.86), rgba(14,24,42,.88));
+    }
+
+    .btn-secondary:active{
+        transform:translateY(4px);
+        box-shadow:
+            0 3px 0 rgba(12, 20, 36, .95),
+            0 8px 16px rgba(2, 9, 20, .3),
+            inset 0 1px 0 rgba(170, 220, 255, .08);
     }
 
     .vehicle-list{
@@ -1569,16 +1722,17 @@ BASE_CSS = """
     }
 
     .tesla-mark{
-        width:64px;
-        height:64px;
-        border-radius:18px;
+        width:88px;
+        height:88px;
+        border-radius:50%;
         background:
-            radial-gradient(circle at 25% 20%, rgba(122,44,255,.36), transparent 52%),
-            radial-gradient(circle at 78% 78%, rgba(0,200,255,.34), transparent 58%),
+            radial-gradient(circle at 26% 22%, rgba(151,98,255,.34), transparent 54%),
+            radial-gradient(circle at 78% 78%, rgba(66,211,255,.28), transparent 60%),
             rgba(6,10,22,.88);
-        border:1px solid rgba(108,182,255,.5);
+        border:1px solid rgba(128,204,255,.58);
         box-shadow:
-            inset 0 1px 0 rgba(255,255,255,.14),
+            inset 0 2px 1px rgba(255,255,255,.22),
+            inset 0 0 0 3px rgba(123,196,255,.2),
             0 16px 26px rgba(0,0,0,.42);
         display:flex;
         align-items:center;
@@ -1588,8 +1742,8 @@ BASE_CSS = """
     }
 
     .vehicle-brand-logo{
-        width:42px;
-        height:42px;
+        width:66px;
+        height:66px;
         display:block;
         object-fit:contain;
         filter:drop-shadow(0 5px 11px rgba(0,0,0,.42));
@@ -1907,17 +2061,16 @@ BASE_CSS = """
         }
 
         .hero-auth{
-            min-height:340px;
-            background-position:68% center;
+            min-height:154px;
+            background-position:center;
         }
 
-        .hero-auth-copy{
+        .pre-auth-copy{
             max-width:100%;
         }
 
-        .hero-auth-actions{
+        .pre-auth-actions{
             justify-content:flex-start;
-            align-items:flex-start;
             min-width:0;
         }
 
@@ -1979,23 +2132,27 @@ BASE_CSS = """
             font-size:38px;
         }
 
-        .hero-auth{
-            min-height:390px;
-            background-position:60% center;
-            padding:24px;
-        }
-
-        .hero-auth h1{
+        .pre-auth-info h1{
             font-size:42px;
         }
 
-        .hero-auth p{
+        .pre-auth-info p{
             font-size:16px;
             line-height:1.55;
         }
 
-        .hero-auth-copy{
-            padding:18px 18px 20px;
+        .pre-auth-info{
+            min-height:200px;
+            align-items:flex-start;
+        }
+
+        .pre-auth-actions{
+            width:100%;
+            justify-content:flex-start;
+        }
+
+        .pre-auth-actions .btn{
+            min-width:190px;
         }
     }
 </style>
@@ -2109,6 +2266,421 @@ def get_or_create_user(wallet_address=None):
     return user
 
 
+def get_or_create_gamification_state(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM gamification_state WHERE user_id = ?", (user_id,))
+    state = cur.fetchone()
+    if state is None:
+        cur.execute(
+            """
+            INSERT INTO gamification_state
+            (user_id, current_streak, longest_streak, completed_challenges_count, total_miles_synced, lifetime_evfi_earned, total_sync_events, telemetry_sync_count, updated_at)
+            VALUES (?, 0, 0, 0, 0, 0, 0, 0, ?)
+            """,
+            (user_id, now_ts()),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM gamification_state WHERE user_id = ?", (user_id,))
+        state = cur.fetchone()
+    conn.close()
+    return state
+
+
+def updateStreak(user_id, activity_date):
+    state = get_or_create_gamification_state(user_id)
+    last_date = parse_calendar_day(state["last_activity_date"])
+    current_date = parse_calendar_day(activity_date) or datetime.fromtimestamp(now_ts()).date()
+    current_streak = int(state["current_streak"] or 0)
+    longest_streak = int(state["longest_streak"] or 0)
+
+    streak_increased = False
+    streak_reset = False
+    if last_date is None:
+        current_streak = 1
+        streak_increased = True
+    elif current_date > last_date:
+        delta_days = (current_date - last_date).days
+        if delta_days == 1:
+            current_streak += 1
+            streak_increased = True
+        elif delta_days > 1:
+            current_streak = 1
+            streak_increased = True
+            streak_reset = True
+
+    if current_streak > longest_streak:
+        longest_streak = current_streak
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE gamification_state
+        SET last_activity_date = ?, current_streak = ?, longest_streak = ?, updated_at = ?
+        WHERE user_id = ?
+        """,
+        (current_date.strftime("%Y-%m-%d"), current_streak, longest_streak, now_ts(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "currentStreak": current_streak,
+        "longestStreak": longest_streak,
+        "streakIncreased": streak_increased,
+        "streakReset": streak_reset,
+    }
+
+
+def updateDailyActivity(user_id, activityDate=None, activity_type="activity"):
+    day = activityDate or calendar_day()
+    streak = updateStreak(user_id, day)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    field = {
+        "login": "last_login_date",
+        "sync": "last_sync_date",
+        "reward_check": "last_reward_check_date",
+        "claim": "last_reward_check_date",
+    }.get(activity_type)
+    if field:
+        cur.execute(
+            f"UPDATE gamification_state SET {field} = ?, updated_at = ? WHERE user_id = ?",
+            (day, now_ts(), user_id),
+        )
+    conn.commit()
+    conn.close()
+
+    events = []
+    if streak["streakIncreased"]:
+        events.append(f"Streak is now {streak['currentStreak']} day{'s' if streak['currentStreak'] != 1 else ''}.")
+    if streak["streakReset"]:
+        events.append("Streak reset after a missed day.")
+    return {"activityDate": day, "streak": streak, "events": events}
+
+
+def record_app_activity(user_id, activity_type, activity_ts=None):
+    day = calendar_day(activity_ts)
+    activity = updateDailyActivity(user_id, day, activity_type)
+    challenges = updateChallengeProgress(user_id, {"verified_miles": 0.0})
+    badges = awardEligibleBadges(user_id)
+    events = []
+    events.extend(activity["events"])
+    events.extend(challenges["events"])
+    events.extend(badges["events"])
+    return {
+        "activity": activity,
+        "challenges": challenges,
+        "badges": badges,
+        "events": events,
+    }
+
+
+def calculateMileageDelta(previousOdometer, currentOdometer):
+    try:
+        previous = float(previousOdometer or 0)
+        current = float(currentOdometer or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, current - previous)
+
+
+def record_evfi_earning(user_id, event_key, amount, source):
+    get_or_create_gamification_state(user_id)
+    event_amount = round(max(0.0, float(amount or 0.0)), 2)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT amount FROM gamification_evfi_events WHERE user_id = ? AND event_key = ?",
+        (user_id, event_key),
+    )
+    existing = cur.fetchone()
+    previous_amount = float(existing["amount"] or 0.0) if existing else 0.0
+    delta = round(event_amount - previous_amount, 2)
+
+    if existing is None:
+        cur.execute(
+            """
+            INSERT INTO gamification_evfi_events (user_id, event_key, source, amount, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, event_key, source, event_amount, now_ts(), now_ts()),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE gamification_evfi_events
+            SET source = ?, amount = ?, updated_at = ?
+            WHERE user_id = ? AND event_key = ?
+            """,
+            (source, event_amount, now_ts(), user_id, event_key),
+        )
+
+    if abs(delta) > 0:
+        cur.execute(
+            """
+            UPDATE gamification_state
+            SET lifetime_evfi_earned = MAX(0, COALESCE(lifetime_evfi_earned, 0) + ?),
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (delta, now_ts(), user_id),
+        )
+    conn.commit()
+    conn.close()
+    return delta
+
+
+def upsert_challenge(user_id, challenge_key, progress):
+    definition = CHALLENGE_DEFS[challenge_key]
+    target = float(definition["target"])
+    next_progress = max(0.0, min(float(progress or 0.0), target))
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT completed, progress FROM gamification_challenges WHERE user_id = ? AND challenge_key = ?",
+        (user_id, challenge_key),
+    )
+    row = cur.fetchone()
+    was_completed = bool(row["completed"]) if row else False
+    is_completed = next_progress >= target
+    completed_at = now_ts() if (is_completed and not was_completed) else None
+
+    cur.execute(
+        """
+        INSERT INTO gamification_challenges
+        (user_id, challenge_key, progress, target, completed, completed_at, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, challenge_key) DO UPDATE SET
+            progress = excluded.progress,
+            target = excluded.target,
+            completed = CASE WHEN gamification_challenges.completed = 1 THEN 1 ELSE excluded.completed END,
+            completed_at = CASE
+                WHEN gamification_challenges.completed = 1 THEN gamification_challenges.completed_at
+                WHEN excluded.completed = 1 THEN excluded.completed_at
+                ELSE gamification_challenges.completed_at
+            END,
+            last_updated = excluded.last_updated
+        """,
+        (user_id, challenge_key, next_progress, target, 1 if is_completed else 0, completed_at, now_ts()),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "challengeKey": challenge_key,
+        "progress": next_progress,
+        "target": target,
+        "completedNow": is_completed and not was_completed,
+        "completed": is_completed or was_completed,
+    }
+
+
+def updateChallengeProgress(user_id, telemetryDelta):
+    state = get_or_create_gamification_state(user_id)
+    week_start, week_end = current_week_bounds()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(miles_delta), 0) AS miles
+        FROM gamification_sync_history
+        WHERE user_id = ?
+          AND synced_at BETWEEN ? AND ?
+          AND miles_delta > 0
+        """,
+        (user_id, week_start, week_end),
+    )
+    weekly_miles = float(cur.fetchone()["miles"] or 0.0)
+    cur.execute("SELECT COALESCE(SUM(amount), 0) AS earned FROM gamification_evfi_events WHERE user_id = ?", (user_id,))
+    lifetime_earned = float(cur.fetchone()["earned"] or 0.0)
+    conn.close()
+
+    challenge_updates = [
+        upsert_challenge(user_id, "drive_25_miles_weekly", weekly_miles),
+        upsert_challenge(user_id, "sync_3_days_in_a_row", min(float(state["current_streak"] or 0), CHALLENGE_TARGET_SYNC_3_DAY_STREAK)),
+        upsert_challenge(user_id, "earn_250_evfi", lifetime_earned),
+    ]
+
+    newly_completed = [item for item in challenge_updates if item["completedNow"]]
+    return {
+        "all": challenge_updates,
+        "completedNow": newly_completed,
+        "events": [f"Challenge completed: {CHALLENGE_DEFS[item['challengeKey']]['label']}" for item in newly_completed],
+    }
+
+
+def awardEligibleBadges(user_id):
+    state = get_or_create_gamification_state(user_id)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT badge_key FROM gamification_badges WHERE user_id = ?", (user_id,))
+    existing = {row["badge_key"] for row in cur.fetchall()}
+    cur.execute("SELECT COUNT(*) AS count FROM claims WHERE user_id = ? AND claimed = 1", (user_id,))
+    claimed_count = int(cur.fetchone()["count"] or 0)
+
+    candidates = set()
+    if int(state["total_sync_events"] or 0) >= 1:
+        candidates.add("first_sync")
+    if int(state["current_streak"] or 0) >= 7:
+        candidates.add("streak_7_days")
+    if float(state["total_miles_synced"] or 0.0) >= 100:
+        candidates.add("miles_100")
+    if float(state["total_miles_synced"] or 0.0) >= 500:
+        candidates.add("miles_500")
+    if claimed_count > 0:
+        candidates.add("first_evfi_claim")
+
+    awarded_now = []
+    for badge_key in sorted(candidates):
+        if badge_key in existing:
+            continue
+        cur.execute(
+            """
+            INSERT INTO gamification_badges (user_id, badge_key, badge_name, badge_asset, awarded_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, badge_key, BADGE_DEFS[badge_key], "/static/evfi-token-logo.png", now_ts()),
+        )
+        awarded_now.append({"badgeKey": badge_key, "badgeName": BADGE_DEFS[badge_key]})
+
+    if awarded_now:
+        cur.execute(
+            """
+            UPDATE gamification_state
+            SET completed_challenges_count = (
+                SELECT COUNT(*) FROM gamification_challenges WHERE user_id = ? AND completed = 1
+            ),
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (user_id, now_ts(), user_id),
+        )
+    conn.commit()
+    conn.close()
+    return {
+        "awardedNow": awarded_now,
+        "events": [f"Badge earned: {item['badgeName']}" for item in awarded_now],
+    }
+
+
+def processTelemetrySync(user_id, telemetryData):
+    state = get_or_create_gamification_state(user_id)
+    synced_at = int(telemetryData.get("synced_at") or now_ts())
+    day = calendar_day(synced_at)
+    odometer = float(telemetryData.get("odometer") or 0.0)
+    verified_miles = max(0.0, float(telemetryData.get("verified_miles") or 0.0))
+    telemetry_miles = max(0.0, float(telemetryData.get("miles_delta") or 0.0))
+    previous_odometer = state["last_known_odometer"]
+    odometer_delta = calculateMileageDelta(previous_odometer, odometer)
+    miles_delta = max(telemetry_miles, odometer_delta)
+    battery_level = telemetryData.get("battery_level")
+    charge_rate = telemetryData.get("charge_rate")
+    charging_state = telemetryData.get("charging_state")
+    efficiency_whmi = telemetryData.get("efficiency_whmi")
+
+    activity = updateDailyActivity(user_id, day, "sync")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE gamification_state
+        SET total_miles_synced = COALESCE(total_miles_synced, 0) + ?,
+            last_known_odometer = ?,
+            last_sync_at = ?,
+            last_sync_date = ?,
+            total_sync_events = COALESCE(total_sync_events, 0) + 1,
+            telemetry_sync_count = COALESCE(telemetry_sync_count, 0) + 1,
+            updated_at = ?
+        WHERE user_id = ?
+        """,
+        (miles_delta, odometer, synced_at, day, now_ts(), user_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO gamification_sync_history
+        (user_id, synced_at, odometer, miles_delta, verified_miles, battery_level, charging_state, charge_rate, efficiency_whmi)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            synced_at,
+            odometer,
+            miles_delta,
+            verified_miles,
+            battery_level if battery_level is None else float(battery_level),
+            str(charging_state) if charging_state is not None else None,
+            charge_rate if charge_rate is None else float(charge_rate),
+            efficiency_whmi if efficiency_whmi is None else float(efficiency_whmi),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    challenges = updateChallengeProgress(user_id, {"verified_miles": verified_miles})
+    badges = awardEligibleBadges(user_id)
+    state_after = get_or_create_gamification_state(user_id)
+    events = []
+    events.extend(activity["events"])
+    events.extend(challenges["events"])
+    events.extend(badges["events"])
+    return {
+        "state": dict(state_after),
+        "events": events,
+        "streak": activity["streak"],
+        "challenges": challenges,
+        "badges": badges,
+    }
+
+
+def getGamificationState(user_id):
+    state = get_or_create_gamification_state(user_id)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT challenge_key, progress, target, completed, completed_at
+        FROM gamification_challenges
+        WHERE user_id = ?
+        ORDER BY challenge_key ASC
+        """,
+        (user_id,),
+    )
+    challenges = [dict(row) for row in cur.fetchall()]
+
+    cur.execute(
+        """
+        SELECT badge_key, badge_name, badge_asset, awarded_at
+        FROM gamification_badges
+        WHERE user_id = ?
+        ORDER BY awarded_at DESC
+        """,
+        (user_id,),
+    )
+    badges = [dict(row) for row in cur.fetchall()]
+
+    cur.execute(
+        """
+        SELECT synced_at, odometer, miles_delta, verified_miles, battery_level, charging_state, charge_rate, efficiency_whmi
+        FROM gamification_sync_history
+        WHERE user_id = ?
+        ORDER BY synced_at DESC
+        LIMIT 100
+        """
+        ,
+        (user_id,),
+    )
+    telemetry_history = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return {
+        "state": dict(state),
+        "challenges": challenges,
+        "badges": badges,
+        "telemetrySyncHistory": telemetry_history,
+    }
+
+
 def expire_sport_mode(user_id):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -2159,12 +2731,13 @@ def get_daily_verified_miles(user_id, event_vehicle_id, day_start):
         """
         SELECT COALESCE(SUM(miles_added), 0) AS miles
         FROM reward_events
-        WHERE tesla_vehicle_id = ?
+        WHERE user_id = ?
+          AND tesla_vehicle_id = ?
           AND synced_at >= ?
           AND synced_at < ?
           AND miles_added >= ?
         """,
-        (event_vehicle_id, day_start, day_end, MINIMUM_TRIP_DISTANCE),
+        (user_id, event_vehicle_id, day_start, day_end, MINIMUM_TRIP_DISTANCE),
     )
     miles = float(cur.fetchone()["miles"] or 0)
     conn.close()
@@ -2196,18 +2769,19 @@ def validate_trip_for_scoring(user_id, event_vehicle_id, miles_added, previous_s
     return min(miles_added, remaining)
 
 
-def get_week_verified_miles(event_vehicle_id, week_start, week_end):
+def get_week_verified_miles(user_id, event_vehicle_id, week_start, week_end):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT COALESCE(SUM(miles_added), 0) AS miles
         FROM reward_events
-        WHERE tesla_vehicle_id = ?
+        WHERE user_id = ?
+          AND tesla_vehicle_id = ?
           AND synced_at BETWEEN ? AND ?
           AND miles_added >= ?
         """,
-        (event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
+        (user_id, event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
     )
     miles = float(cur.fetchone()["miles"] or 0)
     conn.close()
@@ -2306,11 +2880,12 @@ def calculate_active_days(user_id, event_vehicle_id, week_start, week_end):
         """
         SELECT synced_at, miles_added
         FROM reward_events
-        WHERE tesla_vehicle_id = ?
+        WHERE user_id = ?
+          AND tesla_vehicle_id = ?
           AND synced_at BETWEEN ? AND ?
           AND miles_added >= ?
         """,
-        (event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
+        (user_id, event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
     )
     days = {time.strftime("%Y-%m-%d", time.localtime(row["synced_at"])) for row in cur.fetchall()}
     conn.close()
@@ -2341,7 +2916,7 @@ def update_missions(user_id, verified_miles, active_days, charge_health_score):
 
 def calculate_weekly_score(user_id, vin, event_vehicle_id, charge_health_score=100.0):
     week_start, week_end = current_week_bounds()
-    verified_miles = get_week_verified_miles(event_vehicle_id, week_start, week_end)
+    verified_miles = get_week_verified_miles(user_id, event_vehicle_id, week_start, week_end)
     active_days = calculate_active_days(user_id, event_vehicle_id, week_start, week_end)
     streak_multiplier = calculate_streak_multiplier(active_days)
     update_missions(user_id, verified_miles, active_days, charge_health_score)
@@ -2451,26 +3026,42 @@ def get_last_distribution(user_id):
 
 
 def get_user_missions(user_id):
-    ensure_weekly_reset(user_id)
     conn = get_db_connection()
     cur = conn.cursor()
-    week_start, _ = current_week_bounds()
     cur.execute(
         """
-        SELECT m.*, b.badge_asset
-        FROM missions m
-        LEFT JOIN mission_badges b
-          ON b.user_id = m.user_id
-         AND b.mission_type = m.mission_type
-         AND b.week_start = ?
-        WHERE m.user_id = ?
-        ORDER BY m.completed ASC, m.mission_type ASC
+        SELECT challenge_key, progress, target, completed, completed_at
+        FROM gamification_challenges
+        WHERE user_id = ?
+        ORDER BY challenge_key ASC
         """,
-        (week_start, user_id),
+        (user_id,),
     )
     rows = cur.fetchall()
+    row_map = {row["challenge_key"]: row for row in rows}
+    ordered_keys = [
+        "drive_25_miles_weekly",
+        "sync_3_days_in_a_row",
+        "earn_250_evfi",
+    ]
+    missions = []
+    for challenge_key in ordered_keys:
+        target = float(CHALLENGE_DEFS[challenge_key]["target"])
+        row = row_map.get(challenge_key)
+        progress = float(row["progress"] if row else 0.0)
+        completed = bool(row["completed"]) if row else False
+        progress_ratio = 1.0 if target <= 0 else min(progress / target, 1.0)
+        missions.append(
+            {
+                "mission_type": CHALLENGE_DEFS[challenge_key]["label"],
+                "progress": round(progress_ratio * 100.0, 2),
+                "completed": 1 if completed else 0,
+                "completed_at": row["completed_at"] if row else None,
+                "badge_asset": "/static/evfi-token-logo.png" if completed else None,
+            }
+        )
     conn.close()
-    return rows
+    return missions
 
 
 def ensure_airdrop_claim(user_id, total_miles):
@@ -2490,7 +3081,9 @@ def ensure_airdrop_claim(user_id, total_miles):
         cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
         claim = cur.fetchone()
         log_v2_event("airdrop_available", user_id=user_id, amount=total_miles)
+    allocated = round(float(claim["evfi_allocated"] or 0.0), 2)
     conn.close()
+    record_evfi_earning(user_id, f"airdrop-allocation:{user_id}", allocated, "airdrop_allocation")
     return claim
 
 
@@ -2636,7 +3229,7 @@ def mint_airdrop_onchain(wallet_address, amount_tokens, batch_id):
         return {"ok": True, "output": stdout}
 
 
-def load_vehicle_and_summary(vid):
+def load_vehicle_and_summary(vid, wallet_address=None):
     state = tesla_api.get_vehicle_state(vid)
     if state is None:
         raise ValueError("Vehicle not found")
@@ -2662,7 +3255,21 @@ def load_vehicle_and_summary(vid):
     meta = get_vehicle_display_meta(vehicle_info)
     vin = str(vehicle_info.get("vin", "Unknown VIN"))
     current_odometer = extract_odometer(vehicle_info)
-    summary = sync_vehicle_rewards(vid, meta["display_name"], vin, current_odometer)
+    charge_state = vehicle_info.get("charge_state", {}) or {}
+    telemetry_data = {
+        "battery_level": charge_state.get("battery_level"),
+        "charging_state": charge_state.get("charging_state"),
+        "charge_rate": charge_state.get("charge_rate"),
+        "efficiency_whmi": vehicle_info.get("drive_state", {}).get("energy_used"),
+    }
+    summary = sync_vehicle_rewards(
+        vid,
+        meta["display_name"],
+        vin,
+        current_odometer,
+        wallet_address=wallet_address,
+        telemetry_data=telemetry_data,
+    )
 
     return {
         "vehicleInfo": vehicle_info,
@@ -2786,8 +3393,8 @@ def get_reward_summary_for_vehicle(vid, display_name, vin, current_odometer):
     return existing
 
 
-def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
-    user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
+def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_address=None, telemetry_data=None):
+    user = get_or_create_user(wallet_address or DEFAULT_WALLET_ADDRESS)
     user = expire_sport_mode(user["id"])
     bind_vehicle_to_user(vin, user["id"], current_odometer)
 
@@ -2820,9 +3427,10 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
 
         cur.execute("""
             INSERT INTO reward_events
-            (tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
-            VALUES (?, ?, ?, ?, ?)
+            (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
+            user["id"],
             str(vid),
             current_odometer,
             0,
@@ -2830,6 +3438,7 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
             now_ts
         ))
         verified_miles = 0.0
+        miles_delta = 0.0
     else:
         previous_latest = float(existing["latest_odometer"] or 0)
         baseline = float(existing["baseline_odometer"] or current_odometer)
@@ -2838,6 +3447,7 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
         miles_added = current_odometer - previous_latest
         if miles_added < 0:
             miles_added = 0
+        miles_delta = float(miles_added)
         verified_miles = validate_trip_for_scoring(user["id"], str(vid), miles_added, previous_synced_at, now_ts)
 
         total_miles = current_odometer - baseline
@@ -2867,9 +3477,10 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
 
         cur.execute("""
             INSERT INTO reward_events
-            (tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
-            VALUES (?, ?, ?, ?, ?)
+            (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
+            user["id"],
             str(vid),
             current_odometer,
             verified_miles,
@@ -2885,6 +3496,19 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer):
     )
     row = cur.fetchone()
     conn.close()
+    processTelemetrySync(
+        user["id"],
+        {
+            "odometer": current_odometer,
+            "miles_delta": miles_delta,
+            "verified_miles": verified_miles,
+            "synced_at": now_ts,
+            "battery_level": (telemetry_data or {}).get("battery_level"),
+            "charging_state": (telemetry_data or {}).get("charging_state"),
+            "charge_rate": (telemetry_data or {}).get("charge_rate"),
+            "efficiency_whmi": (telemetry_data or {}).get("efficiency_whmi"),
+        },
+    )
     calculate_weekly_score(user["id"], vin, str(vid))
     ensure_airdrop_claim(user["id"], current_odometer)
     return row
@@ -2921,25 +3545,30 @@ def index():
         })
 
         body = f"""
-        <section class="hero hero-auth">
-            <div class="hero-auth-copy">
+        <section class="hero hero-auth" aria-hidden="true"></section>
+        <section class="hero pre-auth-info">
+            <div class="pre-auth-copy">
                 <div class="badge">EvFi Phase 1</div>
                 <h1>Connect Tesla telemetry to EVFI rewards.</h1>
                 <p>Use live Tesla odometer data as the offchain score engine, then connect a Sepolia wallet to view and claim real EVFI rewards.</p>
             </div>
-            <div class="hero-auth-actions">
+            <div class="pre-auth-actions">
                 <a class="btn btn-primary" href="{url}">Login with Tesla</a>
             </div>
         </section>
         """
         return render_page("EvFi Fleet", body)
 
+    user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
+    record_app_activity(user["id"], "login")
+
     cars = tesla_api.get_vehicles()
 
     if not cars:
         body = """
-        <section class="hero hero-auth">
-            <div class="hero-auth-copy">
+        <section class="hero hero-auth" aria-hidden="true"></section>
+        <section class="hero pre-auth-info">
+            <div class="pre-auth-copy">
                 <div class="badge">Connected</div>
                 <h1>No vehicles found</h1>
                 <p>Your Tesla account authenticated successfully, but no vehicles were returned.</p>
@@ -2971,8 +3600,10 @@ def index():
         """
 
     body = f"""
-    <section class="hero hero-auth">
-        <div class="hero-auth-copy">
+    <section class="hero hero-auth" aria-hidden="true"></section>
+
+    <section class="hero pre-auth-info">
+        <div class="pre-auth-copy">
             <div class="badge">Connected</div>
             <h1>Your Tesla Vehicles</h1>
             <p>Select a vehicle to open the EvFi telemetry and rewards dashboard.</p>
@@ -3093,7 +3724,10 @@ def dashboard(vid):
 
     summary = get_reward_summary_for_vehicle(vid, display_name, vin, current_odometer)
     events = get_recent_reward_events(vid)
-    user = expire_sport_mode(get_or_create_user(DEFAULT_WALLET_ADDRESS)["id"])
+    user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
+    user = expire_sport_mode(user["id"])
+    activity = record_app_activity(user["id"], "reward_check")
+    gamification = getGamificationState(user["id"])
     weekly_score = get_current_week_score(user["id"], vin) or calculate_weekly_score(user["id"], vin, str(vid))
     missions = get_user_missions(user["id"])
     last_distribution = get_last_distribution(user["id"])
@@ -3163,15 +3797,19 @@ def dashboard(vid):
     last_synced = summary["last_synced_at"]
     last_synced_str = fmt_ts(last_synced)
     score_updated_str = fmt_ts(weekly_score["created_at"] if weekly_score else None)
+    gamification_updated_str = fmt_ts(gamification["state"].get("updated_at"))
     distribution_updated_str = fmt_ts(last_distribution["claimed_at"] if last_distribution and last_distribution["claimed_at"] else (last_distribution["week_end"] if last_distribution else None))
     last_distribution_value = fmt2_grouped(last_distribution["evfi_allocated"] if last_distribution else 0)
     airdrop_status = "Airdrop Claimed" if airdrop_claim and airdrop_claim["claimed"] else "Airdrop Available"
     airdrop_amount = fmt2(airdrop_claim["evfi_allocated"] if airdrop_claim else current_odometer)
-    badge_label = "Sync Vehicle"
-    for badge_candidate in ("stay_active_all_week", "drive_on_5_days", "efficient_trip", "drive_once_today", "sync_vehicle"):
-        if any(m["mission_type"] == badge_candidate and m["completed"] for m in missions):
-            badge_label = badge_candidate.replace("_", " ").title()
-            break
+    badge_label = "No badge earned yet"
+    badge_asset = "/static/evfi-badge-genesis.svg"
+    latest_badge = gamification["badges"][0] if gamification["badges"] else None
+    if latest_badge:
+        badge_label = str(latest_badge.get("badge_name") or badge_label)
+        badge_asset = str(latest_badge.get("badge_asset") or badge_asset)
+    completed_challenges = sum(1 for challenge in gamification["challenges"] if challenge.get("completed"))
+    total_challenges = len(CHALLENGE_DEFS)
     mission_rows = ""
     for mission in missions:
         mission_complete = bool(mission["completed"])
@@ -3339,16 +3977,16 @@ def dashboard(vid):
 
         <section class="panel secondary-card streak-card">
             <div class="label">Active Streak</div>
-            <h3 class="secondary-card-title">{weekly_score["active_days"] if weekly_score else 0} active days</h3>
-            <p class="secondary-card-copy">Multiplier: {fmt2(weekly_score["streak_multiplier"] if weekly_score else 1.0)}x</p>
-            <div class="sub">Updated {escape(score_updated_str)}</div>
+            <h3 class="secondary-card-title"><span id="currentStreakValue">{int(gamification["state"].get("current_streak") or 0)}</span> day streak</h3>
+            <p class="secondary-card-copy">Longest: <span id="longestStreakValue">{int(gamification["state"].get("longest_streak") or 0)}</span> days</p>
+            <div id="streakUpdatedAt" class="sub">Updated {escape(gamification_updated_str)}</div>
         </section>
 
         <section class="panel secondary-card missions-card">
             <div class="label">Active Missions</div>
-            <h3 class="secondary-card-title value-tone-{value_tone(weekly_score["mission_bonus"] if weekly_score else 0)}" data-count-up="{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)}">{fmt2(weekly_score["mission_bonus"] if weekly_score else 0)} bonus pts</h3>
-            <div class="mission-list">{mission_rows}</div>
-            <div class="sub">Updated {escape(score_updated_str)}</div>
+            <h3 class="secondary-card-title"><span id="challengeCompletedCount">{completed_challenges}</span>/<span id="challengeTotalCount">{total_challenges}</span> completed</h3>
+            <div id="missionList" class="mission-list">{mission_rows}</div>
+            <div id="missionsUpdatedAt" class="sub">Updated {escape(gamification_updated_str)}</div>
         </section>
 
         <section class="panel secondary-card distribution-card">
@@ -3356,7 +3994,7 @@ def dashboard(vid):
             <h3 class="secondary-card-title value-tone-{value_tone(last_distribution["evfi_allocated"] if last_distribution else 0)}" data-count-up="{fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)}">{last_distribution_value} EVFI</h3>
             <p class="secondary-card-copy">Fixed-pool deterministic allocation with weekly caps.</p>
             <div class="badge-display">
-                <img class="nft-badge" src="/static/evfi-badge-genesis.svg" alt="Generated achievement badge">
+                <img class="nft-badge" src="{escape(badge_asset)}" alt="Generated achievement badge">
                 <div>
                     <div class="badge-label">{escape(badge_label)}</div>
                     <div class="sub">Achievement badge attached to the latest completed challenge.</div>
@@ -3460,7 +4098,7 @@ def dashboard(vid):
 @app.route("/sync/<vid>")
 def sync_rewards(vid):
     try:
-        load_vehicle_and_summary(vid)
+        load_vehicle_and_summary(vid, wallet_address=DEFAULT_WALLET_ADDRESS)
     except ValueError:
         return render_page(
             "Vehicle Not Found",
@@ -3478,7 +4116,7 @@ def sync_rewards(vid):
 @app.route("/api/vehicle/<vid>/summary")
 def vehicle_summary_api(vid):
     try:
-        context = load_vehicle_and_summary(vid)
+        context = load_vehicle_and_summary(vid, wallet_address=DEFAULT_WALLET_ADDRESS)
     except ValueError:
         return jsonify({"error": "Vehicle not found"}), 404
     except RuntimeError as exc:
@@ -3499,6 +4137,35 @@ def vehicle_summary_api(vid):
     )
 
 
+@app.route("/api/vehicle/<vid>/gamification")
+def vehicle_gamification_api(vid):
+    wallet = str(request.args.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid wallet is required"}), 400
+
+    try:
+        context = load_vehicle_and_summary(vid, wallet_address=wallet)
+    except ValueError:
+        return jsonify({"error": "Vehicle not found"}), 404
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    user = get_or_create_user(wallet)
+    activity = record_app_activity(user["id"], "reward_check")
+    gamification = getGamificationState(user["id"])
+    return jsonify(
+        {
+            "ok": True,
+            "vehicleId": str(vid),
+            "wallet": wallet,
+            "telemetryScore": float(context["summary"]["drv_balance"] or 0),
+            "totalMiles": float(context["summary"]["total_miles"] or 0),
+            "gamification": gamification,
+            "gamificationEvents": activity["events"],
+        }
+    )
+
+
 @app.route("/api/vehicle/<vid>/assign-demo-reward", methods=["POST"])
 def assign_demo_reward(vid):
     if request.headers.get("x-admin-key") != ADMIN_API_KEY:
@@ -3507,25 +4174,32 @@ def assign_demo_reward(vid):
     if not os.path.exists(EVFI_ASSIGN_SCRIPT):
         return jsonify({"error": f"Missing reward assignment script: {EVFI_ASSIGN_SCRIPT}"}), 500
 
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid recipient wallet is required"}), 400
     try:
-        context = load_vehicle_and_summary(vid)
+        context = load_vehicle_and_summary(vid, wallet_address=wallet)
     except ValueError:
         return jsonify({"error": "Vehicle not found"}), 404
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
 
     summary = context["summary"]
-
-    payload = request.get_json(silent=True) or {}
-    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
     amount_tokens = float(payload.get("amountTokens") or build_demo_assignment_amount(summary))
     batch_id = str(payload.get("batchId") or build_distribution_batch_id(vid, "demo"))
 
+    user = get_or_create_user(wallet)
     try:
         output = assign_demo_reward_onchain(wallet, amount_tokens, batch_id)
     except Exception as exc:
         payload = normalize_assignment_exception(exc)
         return jsonify(payload), 500
+
+    reward_key = f"manual-assignment:{batch_id}"
+    record_evfi_earning(user["id"], reward_key, amount_tokens, "manual_assignment")
+    activity = record_app_activity(user["id"], "reward_check")
+    gamification = getGamificationState(user["id"])
 
     return jsonify(
         {
@@ -3537,6 +4211,8 @@ def assign_demo_reward(vid):
             "telemetryScore": float(summary["drv_balance"] or 0),
             "txHash": output.get("txHash"),
             "output": output,
+            "gamification": gamification,
+            "gamificationEvents": activity["events"],
         }
     )
 
@@ -3549,18 +4225,18 @@ def refresh_and_distribute_reward(vid):
     if not os.path.exists(EVFI_ASSIGN_SCRIPT):
         return jsonify({"error": f"Missing reward assignment script: {EVFI_ASSIGN_SCRIPT}"}), 500
 
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid recipient wallet is required"}), 400
     try:
-        context = load_vehicle_and_summary(vid)
+        context = load_vehicle_and_summary(vid, wallet_address=wallet)
     except ValueError:
         return jsonify({"error": "Vehicle not found"}), 404
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
 
     summary = context["summary"]
-    payload = request.get_json(silent=True) or {}
-    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
-    if not is_valid_evm_address(wallet):
-        return jsonify({"error": "A valid recipient wallet is required"}), 400
 
     user = get_or_create_user(wallet)
     if not bind_vehicle_to_user(context["vin"], user["id"], context["odometer"]):
@@ -3577,6 +4253,15 @@ def refresh_and_distribute_reward(vid):
         payload = normalize_assignment_exception(exc)
         return jsonify(payload), 500
 
+    record_evfi_earning(
+        user["id"],
+        f"weekly-allocation:{weekly_score['week_start']}:{weekly_score['week_end']}",
+        amount_tokens,
+        "weekly_allocation",
+    )
+    activity = record_app_activity(user["id"], "reward_check")
+    gamification = getGamificationState(user["id"])
+
     return jsonify(
         {
             "ok": True,
@@ -3589,6 +4274,8 @@ def refresh_and_distribute_reward(vid):
             "totalMiles": float(summary["total_miles"] or 0),
             "txHash": output.get("txHash"),
             "output": output,
+            "gamification": gamification,
+            "gamificationEvents": activity["events"],
         }
     )
 
@@ -3604,7 +4291,7 @@ def claim_airdrop(vid):
         return jsonify({"error": "A valid recipient wallet is required"}), 400
 
     try:
-        context = load_vehicle_and_summary(vid)
+        context = load_vehicle_and_summary(vid, wallet_address=wallet)
     except ValueError:
         return jsonify({"error": "Vehicle not found"}), 404
     except RuntimeError as exc:
@@ -3616,7 +4303,18 @@ def claim_airdrop(vid):
 
     claim = ensure_airdrop_claim(user["id"], context["odometer"])
     if claim["claimed"]:
-        return jsonify({"ok": True, "message": "Airdrop Claimed", "claimed": True, "amountTokens": claim["evfi_allocated"]})
+        activity = record_app_activity(user["id"], "claim")
+        gamification = getGamificationState(user["id"])
+        return jsonify(
+            {
+                "ok": True,
+                "message": "Airdrop Claimed",
+                "claimed": True,
+                "amountTokens": claim["evfi_allocated"],
+                "gamification": gamification,
+                "gamificationEvents": activity["events"],
+            }
+        )
 
     amount_tokens = round(float(claim["evfi_allocated"] or 0), 2)
     batch_id = build_distribution_batch_id(vid, "airdrop")
@@ -3633,6 +4331,9 @@ def claim_airdrop(vid):
     conn.commit()
     conn.close()
     log_v2_event("airdrop_claim", user_id=user["id"], wallet=wallet, amount=amount_tokens, txHash=output.get("txHash"))
+    record_evfi_earning(user["id"], f"airdrop-claim:{claim['id']}", amount_tokens, "airdrop_claim")
+    activity = record_app_activity(user["id"], "claim")
+    gamification = getGamificationState(user["id"])
 
     return jsonify(
         {
@@ -3644,6 +4345,8 @@ def claim_airdrop(vid):
             "batchId": batch_id,
             "txHash": output.get("txHash"),
             "output": output,
+            "gamification": gamification,
+            "gamificationEvents": activity["events"],
         }
     )
 

@@ -51,9 +51,10 @@ EVFI_TOKEN_ADDRESS = os.getenv("EVFI_TOKEN_ADDRESS", "")
 EVFI_REWARDS_ADDRESS = os.getenv("EVFI_REWARDS_ADDRESS", "")
 WEEKLY_REWARD_POOL = os.getenv("WEEKLY_REWARD_POOL", "10000")
 MAX_WEEKLY_EVFI = float(os.getenv("MAX_WEEKLY_EVFI", "1000"))
+ONBOARDING_AIRDROP_EVFI = float(os.getenv("ONBOARDING_AIRDROP_EVFI", "100"))
+WEEKLY_SCORE_BOOTSTRAP_FLOOR = float(os.getenv("WEEKLY_SCORE_BOOTSTRAP_FLOOR", "10000"))
+MISSION_BONUS_CAP_SHARE = float(os.getenv("MISSION_BONUS_CAP_SHARE", "0.25"))
 EVFI_ASSIGN_SCRIPT = os.getenv("EVFI_ASSIGN_SCRIPT", "evfi_assign_rewards.mjs")
-EVFI_ASSIGN_RATE = float(os.getenv("EVFI_ASSIGN_RATE", "0.25"))
-EVFI_MIN_ASSIGNMENT = float(os.getenv("EVFI_MIN_ASSIGNMENT", "5"))
 
 MINIMUM_TRIP_DISTANCE = 2.0
 MINIMUM_TRIP_DURATION_SECONDS = 5 * 60
@@ -68,6 +69,28 @@ SPORT_MODE_COOLDOWN_SECONDS = 24 * 60 * 60
 CHALLENGE_TARGET_DRIVE_25 = 25.0
 CHALLENGE_TARGET_SYNC_3_DAY_STREAK = 3.0
 CHALLENGE_TARGET_EARN_250_EVFI = 250.0
+SYNC_PARTICIPATION_POINTS = 5.0
+SYNC_PARTICIPATION_CAP = 20.0
+HEALTHY_CHARGE_SESSION_POINTS = 10.0
+HEALTHY_CHARGE_SCORE_CAP = 30.0
+HIGH_SOC_CHARGE_PENALTY = 12.5
+OFFPEAK_CHARGE_SESSION_POINTS = 6.0
+OFFPEAK_CHARGE_SCORE_CAP = 18.0
+AC_CHARGE_SESSION_POINTS = 4.0
+AC_CHARGE_SCORE_CAP = 12.0
+FAST_CHARGE_SESSION_PENALTY = 8.0
+FAST_CHARGE_PENALTY_CAP = 24.0
+EFFICIENCY_BONUS_CAP = 35.0
+EFFICIENCY_PENALTY_CAP = 20.0
+TELEMETRY_REJECTION_PENALTY = 15.0
+OFFPEAK_START_HOUR = int(os.getenv("OFFPEAK_START_HOUR", "22"))
+OFFPEAK_END_HOUR = int(os.getenv("OFFPEAK_END_HOUR", "6"))
+CHARGE_SESSION_GAP_SECONDS = int(os.getenv("CHARGE_SESSION_GAP_SECONDS", str(3 * 60 * 60)))
+HEALTHY_CHARGE_MIN_SOC = float(os.getenv("HEALTHY_CHARGE_MIN_SOC", "15"))
+HEALTHY_CHARGE_MAX_SOC = float(os.getenv("HEALTHY_CHARGE_MAX_SOC", "80"))
+HIGH_SOC_THRESHOLD = float(os.getenv("HIGH_SOC_THRESHOLD", "95"))
+AC_CHARGE_MAX_KW = float(os.getenv("AC_CHARGE_MAX_KW", "19.5"))
+FAST_CHARGE_MIN_KW = float(os.getenv("FAST_CHARGE_MIN_KW", "45"))
 
 CHALLENGE_DEFS = {
     "drive_25_miles_weekly": {
@@ -81,7 +104,7 @@ CHALLENGE_DEFS = {
         "window": "weekly",
     },
     "earn_250_evfi": {
-        "label": "Earn 250 EVFI",
+        "label": "Earn 250 EVFi",
         "target": CHALLENGE_TARGET_EARN_250_EVFI,
         "window": "monthly",
     },
@@ -92,7 +115,7 @@ BADGE_DEFS = {
     "streak_7_days": "7-Day Streak Badge",
     "miles_100": "100 Miles Synced Badge",
     "miles_500": "500 Miles Synced Badge",
-    "first_evfi_claim": "First EVFI Claim Badge",
+    "first_evfi_claim": "First EVFi Claim Badge",
 }
 
 STATE = secrets.token_urlsafe(32)
@@ -191,6 +214,341 @@ def log_rule_violation(rule_name, **payload):
     app.logger.warning("[evfi-v2-rule] %s %s", rule_name, json.dumps(payload, sort_keys=True, default=str))
 
 
+def as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def parse_json_object(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def is_offpeak_hour(local_hour):
+    hour = int(local_hour or 0)
+    if OFFPEAK_START_HOUR == OFFPEAK_END_HOUR:
+        return True
+    if OFFPEAK_START_HOUR < OFFPEAK_END_HOUR:
+        return OFFPEAK_START_HOUR <= hour < OFFPEAK_END_HOUR
+    return hour >= OFFPEAK_START_HOUR or hour < OFFPEAK_END_HOUR
+
+
+def build_charge_policy_summary():
+    return {
+        "offpeakStartHour": OFFPEAK_START_HOUR,
+        "offpeakEndHour": OFFPEAK_END_HOUR,
+        "sessionGapSeconds": CHARGE_SESSION_GAP_SECONDS,
+        "healthyChargeMinSoc": round(HEALTHY_CHARGE_MIN_SOC, 2),
+        "healthyChargeMaxSoc": round(HEALTHY_CHARGE_MAX_SOC, 2),
+        "highSocThreshold": round(HIGH_SOC_THRESHOLD, 2),
+        "acChargeMaxKw": round(AC_CHARGE_MAX_KW, 2),
+        "fastChargeMinKw": round(FAST_CHARGE_MIN_KW, 2),
+    }
+
+
+def classify_charge_session(session):
+    session["healthy"] = session["start_battery"] >= HEALTHY_CHARGE_MIN_SOC and session["max_battery"] <= HEALTHY_CHARGE_MAX_SOC
+    session["high_soc"] = session["max_battery"] >= HIGH_SOC_THRESHOLD
+    session["ac_charge"] = session["max_charge_rate"] > 0 and session["max_charge_rate"] <= AC_CHARGE_MAX_KW
+    session["fast_charge"] = session["max_charge_rate"] >= FAST_CHARGE_MIN_KW
+    session["session_hours"] = round(max(0.0, (session["session_end_ts"] - session["session_start_ts"]) / 3600), 2)
+    return session
+
+
+def append_charge_session_record(cur, user_id, session, status="closed"):
+    session = classify_charge_session(dict(session))
+    cur.execute(
+        """
+        INSERT INTO charge_sessions
+        (user_id, session_start_ts, session_end_ts, last_synced_at, start_battery, end_battery, max_battery, snapshot_count, avg_charge_rate, max_charge_rate, offpeak, healthy, high_soc, ac_charge, fast_charge, status, details_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            int(session["session_start_ts"]),
+            int(session["session_end_ts"]),
+            int(session["last_synced_at"]),
+            as_float(session["start_battery"], 0.0),
+            as_float(session["end_battery"], 0.0),
+            as_float(session["max_battery"], 0.0),
+            int(session["snapshot_count"]),
+            as_float(session["avg_charge_rate"], 0.0),
+            as_float(session["max_charge_rate"], 0.0),
+            1 if session.get("offpeak") else 0,
+            1 if session.get("healthy") else 0,
+            1 if session.get("high_soc") else 0,
+            1 if session.get("ac_charge") else 0,
+            1 if session.get("fast_charge") else 0,
+            status,
+            json.dumps({"sessionHours": session["session_hours"]}, sort_keys=True),
+            now_ts(),
+            now_ts(),
+        ),
+    )
+
+
+def rebuild_charge_sessions(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS total FROM charge_sessions")
+    if int(cur.fetchone()["total"] or 0) > 0:
+        return
+
+    cur.execute(
+        """
+        SELECT user_id, synced_at, battery_level, charging_state, charge_rate
+        FROM gamification_sync_history
+        WHERE user_id IS NOT NULL
+          AND charging_state IS NOT NULL
+          AND lower(charging_state) IN ('charging', 'complete')
+        ORDER BY user_id ASC, synced_at ASC, id ASC
+        """
+    )
+    rows = cur.fetchall()
+    current_user_id = None
+    current_session = None
+    for row in rows:
+        user_id = int(row["user_id"])
+        synced_at = int(row["synced_at"] or 0)
+        battery_level = as_float(row["battery_level"], 0.0)
+        charge_rate = as_float(row["charge_rate"], 0.0)
+        charging_state = str(row["charging_state"] or "").lower()
+        local_hour = datetime.fromtimestamp(synced_at).hour
+        needs_new = (
+            current_session is None
+            or current_user_id != user_id
+            or (synced_at - current_session["last_synced_at"]) > CHARGE_SESSION_GAP_SECONDS
+        )
+        if needs_new:
+            if current_session is not None:
+                append_charge_session_record(cur, current_user_id, current_session, status="closed")
+            current_user_id = user_id
+            current_session = {
+                "session_start_ts": synced_at,
+                "session_end_ts": synced_at,
+                "last_synced_at": synced_at,
+                "start_battery": battery_level,
+                "end_battery": battery_level,
+                "max_battery": battery_level,
+                "snapshot_count": 1,
+                "avg_charge_rate": charge_rate,
+                "max_charge_rate": charge_rate,
+                "offpeak": is_offpeak_hour(local_hour),
+            }
+        else:
+            current_session["session_end_ts"] = synced_at
+            current_session["last_synced_at"] = synced_at
+            current_session["end_battery"] = battery_level
+            current_session["max_battery"] = max(current_session["max_battery"], battery_level)
+            current_session["snapshot_count"] += 1
+            current_session["avg_charge_rate"] = ((current_session["avg_charge_rate"] * (current_session["snapshot_count"] - 1)) + charge_rate) / current_session["snapshot_count"]
+            current_session["max_charge_rate"] = max(current_session["max_charge_rate"], charge_rate)
+            current_session["offpeak"] = current_session["offpeak"] or is_offpeak_hour(local_hour)
+
+        if charging_state == "complete":
+            append_charge_session_record(cur, current_user_id, current_session, status="closed")
+            current_session = None
+            current_user_id = None
+
+    if current_session is not None and current_user_id is not None:
+        append_charge_session_record(cur, current_user_id, current_session, status="closed")
+
+
+def update_or_close_charge_session(user_id, synced_at, battery_level, charging_state, charge_rate):
+    state = str(charging_state or "").lower()
+    is_charging = state in ("charging", "complete")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM charge_sessions
+        WHERE user_id = ? AND status = 'open'
+        ORDER BY session_start_ts DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    active = cur.fetchone()
+    active_id = int(active["id"]) if active else None
+
+    if active and (int(synced_at) - int(active["last_synced_at"] or active["session_end_ts"] or 0)) > CHARGE_SESSION_GAP_SECONDS:
+        cur.execute(
+            "UPDATE charge_sessions SET status = 'closed', updated_at = ? WHERE id = ?",
+            (now_ts(), active_id),
+        )
+        active = None
+        active_id = None
+
+    if not is_charging:
+        if active_id is not None:
+            cur.execute(
+                "UPDATE charge_sessions SET status = 'closed', updated_at = ? WHERE id = ?",
+                (now_ts(), active_id),
+            )
+        conn.commit()
+        conn.close()
+        return
+
+    local_hour = datetime.fromtimestamp(int(synced_at)).hour
+    if active is None:
+        session = classify_charge_session(
+            {
+                "session_start_ts": int(synced_at),
+                "session_end_ts": int(synced_at),
+                "last_synced_at": int(synced_at),
+                "start_battery": as_float(battery_level, 0.0),
+                "end_battery": as_float(battery_level, 0.0),
+                "max_battery": as_float(battery_level, 0.0),
+                "snapshot_count": 1,
+                "avg_charge_rate": as_float(charge_rate, 0.0),
+                "max_charge_rate": as_float(charge_rate, 0.0),
+                "offpeak": is_offpeak_hour(local_hour),
+            }
+        )
+        cur.execute(
+            """
+            INSERT INTO charge_sessions
+            (user_id, session_start_ts, session_end_ts, last_synced_at, start_battery, end_battery, max_battery, snapshot_count, avg_charge_rate, max_charge_rate, offpeak, healthy, high_soc, ac_charge, fast_charge, status, details_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                session["session_start_ts"],
+                session["session_end_ts"],
+                session["last_synced_at"],
+                session["start_battery"],
+                session["end_battery"],
+                session["max_battery"],
+                session["snapshot_count"],
+                session["avg_charge_rate"],
+                session["max_charge_rate"],
+                1 if session["offpeak"] else 0,
+                1 if session["healthy"] else 0,
+                1 if session["high_soc"] else 0,
+                1 if session["ac_charge"] else 0,
+                1 if session["fast_charge"] else 0,
+                "open" if state == "charging" else "closed",
+                json.dumps({"sessionHours": session["session_hours"]}, sort_keys=True),
+                now_ts(),
+                now_ts(),
+            ),
+        )
+    else:
+        snapshot_count = int(active["snapshot_count"] or 0) + 1
+        avg_charge_rate = (
+            (as_float(active["avg_charge_rate"], 0.0) * int(active["snapshot_count"] or 0)) + as_float(charge_rate, 0.0)
+        ) / max(snapshot_count, 1)
+        session = classify_charge_session(
+            {
+                "session_start_ts": int(active["session_start_ts"] or synced_at),
+                "session_end_ts": int(synced_at),
+                "last_synced_at": int(synced_at),
+                "start_battery": as_float(active["start_battery"], battery_level),
+                "end_battery": as_float(battery_level, 0.0),
+                "max_battery": max(as_float(active["max_battery"], 0.0), as_float(battery_level, 0.0)),
+                "snapshot_count": snapshot_count,
+                "avg_charge_rate": avg_charge_rate,
+                "max_charge_rate": max(as_float(active["max_charge_rate"], 0.0), as_float(charge_rate, 0.0)),
+                "offpeak": bool(int(active["offpeak"] or 0)) or is_offpeak_hour(local_hour),
+            }
+        )
+        cur.execute(
+            """
+            UPDATE charge_sessions
+            SET session_end_ts = ?,
+                last_synced_at = ?,
+                end_battery = ?,
+                max_battery = ?,
+                snapshot_count = ?,
+                avg_charge_rate = ?,
+                max_charge_rate = ?,
+                offpeak = ?,
+                healthy = ?,
+                high_soc = ?,
+                ac_charge = ?,
+                fast_charge = ?,
+                status = ?,
+                details_json = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                session["session_end_ts"],
+                session["last_synced_at"],
+                session["end_battery"],
+                session["max_battery"],
+                session["snapshot_count"],
+                session["avg_charge_rate"],
+                session["max_charge_rate"],
+                1 if session["offpeak"] else 0,
+                1 if session["healthy"] else 0,
+                1 if session["high_soc"] else 0,
+                1 if session["ac_charge"] else 0,
+                1 if session["fast_charge"] else 0,
+                "open" if state == "charging" else "closed",
+                json.dumps({"sessionHours": session["session_hours"]}, sort_keys=True),
+                now_ts(),
+                active_id,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+def repair_reward_event_history(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, verified_miles
+        FROM reward_events
+        ORDER BY tesla_vehicle_id ASC, synced_at ASC, id ASC
+        """
+    )
+    rows = cur.fetchall()
+
+    previous_odometer_by_vehicle = {}
+    updates = []
+    for row in rows:
+        vehicle_id = str(row["tesla_vehicle_id"] or "")
+        odometer = as_float(row["odometer_reading"], 0.0)
+        previous_odometer = previous_odometer_by_vehicle.get(vehicle_id)
+        calculated_miles = 0.0 if previous_odometer is None else max(0.0, odometer - previous_odometer)
+        current_miles = max(0.0, as_float(row["miles_added"], 0.0))
+        verified_miles = row["verified_miles"]
+        if verified_miles is None:
+            verified_miles = row["drv_earned"]
+        if verified_miles is None:
+            verified_miles = row["miles_added"]
+        verified_miles = max(0.0, as_float(verified_miles, 0.0))
+        current_score = max(0.0, as_float(row["drv_earned"], 0.0))
+        if abs(current_miles - calculated_miles) > 1e-6 or row["verified_miles"] is None or abs(current_score - verified_miles) > 1e-6:
+            updates.append((calculated_miles, verified_miles, verified_miles, int(row["id"])))
+        previous_odometer_by_vehicle[vehicle_id] = odometer
+
+    if updates:
+        cur.executemany(
+            """
+            UPDATE reward_events
+            SET miles_added = ?,
+                verified_miles = ?,
+                drv_earned = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+        log_v2_event("reward_event_history_repaired", updated_rows=len(updates))
+
+
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -222,6 +580,11 @@ def init_db():
 
     try:
         cur.execute("ALTER TABLE reward_events ADD COLUMN user_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE reward_events ADD COLUMN verified_miles REAL")
     except sqlite3.OperationalError:
         pass
 
@@ -265,6 +628,11 @@ def init_db():
     )
     """)
 
+    try:
+        cur.execute("ALTER TABLE weekly_scores ADD COLUMN score_breakdown_json TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS missions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,6 +658,16 @@ def init_db():
         UNIQUE(user_id, week_start, week_end)
     )
     """)
+
+    try:
+        cur.execute("ALTER TABLE claims ADD COLUMN reward_type TEXT DEFAULT 'weekly'")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE claims ADD COLUMN allocation_context_json TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS mission_badges (
@@ -416,6 +794,61 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS utility_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action_key TEXT,
+        action_type TEXT,
+        amount_evfi REAL DEFAULT 0,
+        status TEXT DEFAULT 'completed',
+        details_json TEXT,
+        created_at INTEGER,
+        completed_at INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS staking_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        tier_key TEXT,
+        stake_evfi REAL DEFAULT 0,
+        reward_boost_pct REAL DEFAULT 0,
+        status TEXT DEFAULT 'active',
+        details_json TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS charge_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        session_start_ts INTEGER,
+        session_end_ts INTEGER,
+        last_synced_at INTEGER,
+        start_battery REAL,
+        end_battery REAL,
+        max_battery REAL,
+        snapshot_count INTEGER DEFAULT 0,
+        avg_charge_rate REAL,
+        max_charge_rate REAL,
+        offpeak INTEGER DEFAULT 0,
+        healthy INTEGER DEFAULT 0,
+        high_soc INTEGER DEFAULT 0,
+        ac_charge INTEGER DEFAULT 0,
+        fast_charge INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'open',
+        details_json TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    )
+    """)
+
+    repair_reward_event_history(conn)
+    rebuild_charge_sessions(conn)
     conn.commit()
     conn.close()
 
@@ -543,6 +976,28 @@ BASE_CSS = """
         margin:26px auto;
         position:relative;
         z-index:1;
+    }
+
+    .dashboard-brand-banner{
+        width:min(980px, 92vw);
+        min-height:88px;
+        border-radius:18px;
+        border:1px solid rgba(110,188,255,.22);
+        background:
+            linear-gradient(90deg, rgba(4,8,18,.86) 0%, rgba(4,8,18,.34) 42%, rgba(4,8,18,.82) 100%),
+            url('/static/EVFi-banner-dark.png') center center / contain no-repeat;
+        box-shadow:0 18px 54px rgba(0,0,0,.38);
+        margin:0 auto 16px;
+        position:relative;
+        overflow:hidden;
+    }
+
+    .dashboard-brand-banner::after{
+        content:"";
+        position:absolute;
+        inset:auto 28px 18px 28px;
+        height:1px;
+        background:linear-gradient(90deg, transparent, rgba(32,227,124,.45), rgba(65,189,255,.45), transparent);
     }
 
     .hero{
@@ -1455,9 +1910,26 @@ BASE_CSS = """
         font-weight:700;
     }
 
+    .reward-engine-grid{
+        margin-top:16px;
+    }
+
+    .reward-engine-card{
+        grid-column:1 / -1;
+    }
+
     .v2-score-grid{
         margin-top:16px;
         grid-template-columns:repeat(4, minmax(0,1fr));
+        align-items:start;
+    }
+
+    .score-breakdown-card{
+        grid-column:span 3;
+    }
+
+    .score-explain-card{
+        grid-column:span 2;
     }
 
     .score-card{
@@ -1483,6 +1955,7 @@ BASE_CSS = """
         box-shadow:0 0 32px rgba(255,205,92,.09);
         background:linear-gradient(180deg, rgba(255,205,92,.07), rgba(255,255,255,.02));
         position:relative;
+        grid-column:span 2;
     }
 
     .distribution-card::after{
@@ -1660,6 +2133,68 @@ BASE_CSS = """
         color:#f4f7fc;
     }
 
+    .achievement-strip{
+        display:grid;
+        gap:10px;
+        margin-top:14px;
+    }
+
+    .achievement-badge{
+        display:flex;
+        align-items:center;
+        gap:12px;
+        padding:12px;
+        border-radius:16px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.07);
+    }
+
+    .achievement-badge img{
+        width:46px;
+        height:46px;
+        border-radius:12px;
+        box-shadow:0 12px 24px rgba(105,167,255,.16);
+    }
+
+    .achievement-badge strong{
+        display:block;
+        color:#f4f7fc;
+        font-family:'Oxanium', sans-serif;
+        font-size:15px;
+    }
+
+    .score-card-metrics,
+    .streak-metrics{
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:10px;
+        margin-top:16px;
+    }
+
+    .score-mini-metric,
+    .streak-mini-metric{
+        padding:12px;
+        border-radius:14px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
+    .score-mini-metric span,
+    .streak-mini-metric span{
+        display:block;
+        color:rgba(255,255,255,.58);
+        font-size:10px;
+        letter-spacing:.08em;
+        text-transform:uppercase;
+        margin-bottom:6px;
+    }
+
+    .score-mini-metric strong,
+    .streak-mini-metric strong{
+        font-family:'Oxanium', sans-serif;
+        font-size:18px;
+    }
+
     .tesla-logo{
         width:44px;
         height:44px;
@@ -1775,18 +2310,16 @@ BASE_CSS = """
     }
 
     .tesla-mark{
-        width:88px;
-        height:88px;
+        width:104px;
+        height:104px;
+        padding:6px;
         border-radius:50%;
-        background:
-            radial-gradient(circle at 26% 22%, rgba(151,98,255,.34), transparent 54%),
-            radial-gradient(circle at 78% 78%, rgba(66,211,255,.28), transparent 60%),
-            rgba(6,10,22,.88);
-        border:1px solid rgba(128,204,255,.58);
+        background:transparent;
+        border:2px solid rgba(128,204,255,.34);
         box-shadow:
-            inset 0 2px 1px rgba(255,255,255,.22),
-            inset 0 0 0 3px rgba(123,196,255,.2),
-            0 16px 26px rgba(0,0,0,.42);
+            0 0 0 1px rgba(123,196,255,.18),
+            0 16px 30px rgba(0,0,0,.42),
+            0 0 34px rgba(66,211,255,.18);
         display:flex;
         align-items:center;
         justify-content:center;
@@ -1795,10 +2328,12 @@ BASE_CSS = """
     }
 
     .vehicle-brand-logo{
-        width:66px;
-        height:66px;
+        width:100%;
+        height:100%;
         display:block;
         object-fit:contain;
+        border-radius:50%;
+        transform:none;
         filter:drop-shadow(0 5px 11px rgba(0,0,0,.42));
     }
 
@@ -2267,7 +2802,357 @@ BASE_CSS = """
             min-width:190px;
         }
     }
-</style>
+    .score-breakdown-grid{
+        display:grid;
+        grid-template-columns:repeat(5,minmax(116px,1fr));
+        gap:10px;
+        margin-top:16px;
+    }
+    .score-breakdown-item{
+        border:1px solid rgba(255,255,255,.08);
+        border-radius:12px;
+        padding:11px 12px;
+        background:rgba(255,255,255,.03);
+        min-height:72px;
+    }
+    .score-breakdown-label{
+        font-size:10px;
+        text-transform:uppercase;
+        letter-spacing:.07em;
+        color:rgba(255,255,255,.55);
+        margin-bottom:6px;
+    }
+    .score-breakdown-value{
+        font-size:20px;
+        font-weight:700;
+        color:#f5f7fb;
+        word-break:normal;
+        overflow-wrap:anywhere;
+        line-height:1.05;
+    }
+    .score-explanation-list{
+        margin:16px 0 0;
+        padding-left:18px;
+        display:grid;
+        gap:10px;
+        color:rgba(245,247,251,.88);
+    }
+    .score-explanation-item{
+        line-height:1.55;
+    }
+    .utility-grid{
+        display:grid;
+        grid-template-columns:repeat(4,minmax(0,1fr));
+        gap:14px;
+        margin-top:16px;
+    }
+    .utility-summary-grid{
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:14px;
+        margin-top:16px;
+    }
+    .utility-summary-card{
+        border:1px solid rgba(255,255,255,.08);
+        border-radius:18px;
+        padding:16px;
+        background:rgba(255,255,255,.04);
+    }
+    .utility-card{
+        border:1px solid rgba(255,255,255,.08);
+        border-radius:16px;
+        padding:18px;
+        background:linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+    }
+    .utility-card-label{
+        font-size:12px;
+        letter-spacing:.08em;
+        text-transform:uppercase;
+        color:rgba(255,255,255,.58);
+        margin-bottom:8px;
+    }
+    .utility-card-value{
+        font-family:'Oxanium', sans-serif;
+        font-size:28px;
+        font-weight:800;
+        color:#f5f7fb;
+        margin-bottom:8px;
+    }
+    .utility-card-copy{
+        color:rgba(245,247,251,.78);
+        line-height:1.5;
+        font-size:14px;
+    }
+    .utility-action-button{
+        margin-top:14px;
+        border:none;
+        border-radius:999px;
+        padding:14px 18px;
+        font-weight:700;
+        font-family:'Oxanium', sans-serif;
+        background:linear-gradient(135deg,#20e37c,#0ba5ec);
+        color:#071018;
+        cursor:pointer;
+        width:100%;
+        box-shadow:0 10px 24px rgba(13,181,183,.18), inset 0 1px 0 rgba(255,255,255,.42);
+    }
+    .utility-action-button:disabled{
+        opacity:.45;
+        cursor:not-allowed;
+    }
+    .utility-action-button-secondary{
+        background:rgba(255,255,255,.08);
+        color:#f5f7fb;
+        border:1px solid rgba(255,255,255,.12);
+    }
+    .history-panel{
+        overflow-x:auto;
+    }
+    .history-panel table{
+        min-width:560px;
+    }
+
+    .contracts-panel{
+        padding:24px 28px;
+    }
+
+    .contracts-grid{
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:12px;
+        margin-top:16px;
+    }
+
+    .contract-item{
+        padding:14px 16px;
+        border-radius:14px;
+        background:rgba(255,255,255,.035);
+        border:1px solid rgba(255,255,255,.06);
+    }
+
+    .contract-label{
+        color:rgba(255,255,255,.56);
+        font-size:11px;
+        letter-spacing:.08em;
+        text-transform:uppercase;
+        margin-bottom:8px;
+    }
+
+    .contract-value{
+        color:#f4f7fc;
+        font-family:'Oxanium', sans-serif;
+        font-size:14px;
+        overflow-wrap:anywhere;
+    }
+
+    .onchain-staking-card{
+        margin-top:18px;
+        padding:22px;
+        border:1px solid rgba(85,205,255,.18);
+        border-radius:18px;
+        background:
+            radial-gradient(circle at 12% 0%, rgba(32,227,124,.12), transparent 34%),
+            linear-gradient(180deg, rgba(20,25,35,.88), rgba(13,16,23,.96));
+        box-shadow:0 18px 42px rgba(0,0,0,.28);
+    }
+
+    .staking-panel-header{
+        display:flex;
+        justify-content:space-between;
+        align-items:flex-start;
+        gap:12px;
+        flex-wrap:wrap;
+    }
+
+    .staking-panel-header h3{
+        margin:0 0 6px;
+        font-family:'Oxanium', sans-serif;
+        font-size:26px;
+    }
+
+    .staking-panel-header p,
+    .staking-status{
+        margin:0;
+        color:rgba(245,247,251,.74);
+        line-height:1.45;
+    }
+
+    .staking-refresh-button,
+    .onchain-unstake-button{
+        border:1px solid rgba(255,255,255,.12);
+        border-radius:999px;
+        background:rgba(255,255,255,.07);
+        color:#f5f7fb;
+        font-weight:700;
+        padding:10px 14px;
+        cursor:pointer;
+    }
+
+    .staking-summary-grid{
+        display:grid;
+        grid-template-columns:repeat(4,minmax(0,1fr));
+        gap:12px;
+        margin-top:16px;
+    }
+
+    .staking-summary-stat{
+        padding:14px;
+        border-radius:14px;
+        background:rgba(255,255,255,.04);
+        border:1px solid rgba(255,255,255,.07);
+    }
+
+    .staking-summary-stat strong{
+        display:block;
+        color:rgba(255,255,255,.58);
+        text-transform:uppercase;
+        letter-spacing:.08em;
+        font-size:10px;
+        margin-bottom:6px;
+    }
+
+    .staking-summary-stat div{
+        font-family:'Oxanium', sans-serif;
+        font-size:22px;
+        color:#f5f7fb;
+    }
+
+    .staking-source{
+        margin-top:8px;
+        color:rgba(255,255,255,.48);
+        font-size:12px;
+    }
+
+    .staking-form{
+        display:grid;
+        grid-template-columns:1.1fr .9fr auto;
+        gap:14px;
+        align-items:end;
+        margin-top:18px;
+    }
+
+    .staking-form label{
+        display:grid;
+        gap:8px;
+        color:#e8edf7;
+        font-weight:700;
+    }
+
+    .staking-form input,
+    .staking-form select{
+        width:100%;
+        min-height:48px;
+        border-radius:12px;
+        border:1px solid rgba(255,255,255,.12);
+        background:rgba(3,7,13,.72);
+        color:#f5f7fb;
+        padding:0 14px;
+        font-size:18px;
+        font-family:'Oxanium', sans-serif;
+    }
+
+    .stake-onchain-button{
+        min-height:48px;
+        border:none;
+        border-radius:999px;
+        padding:0 26px;
+        background:linear-gradient(135deg,#20e37c,#44d9ff);
+        color:#051019;
+        font-family:'Oxanium', sans-serif;
+        font-weight:800;
+        box-shadow:0 12px 28px rgba(32,227,124,.18), inset 0 1px 0 rgba(255,255,255,.45);
+        cursor:pointer;
+    }
+
+    .staking-position-card{
+        margin-top:12px;
+        padding:16px;
+        border:1px solid rgba(255,255,255,.08);
+        border-radius:16px;
+        background:rgba(255,255,255,.035);
+    }
+    @media (max-width: 1080px){
+        .score-breakdown-grid{
+            grid-template-columns:repeat(3,minmax(0,1fr));
+        }
+        .utility-grid{
+            grid-template-columns:repeat(2,minmax(0,1fr));
+        }
+        .utility-summary-grid{
+            grid-template-columns:1fr;
+        }
+        .score-breakdown-card,
+        .score-explain-card,
+        .distribution-card{
+            grid-column:auto;
+        }
+        .staking-summary-grid{
+            grid-template-columns:repeat(2,minmax(0,1fr));
+        }
+        .staking-form,
+        .contracts-grid{
+            grid-template-columns:1fr;
+        }
+    }
+    @media (max-width: 900px){
+        .topbar,
+        .stats-grid,
+        .dashboard-grid,
+        .v2-score-grid{
+            grid-template-columns:1fr !important;
+        }
+        .quick-actions,
+        .wallet-grid,
+        .distribution-grid,
+        .summary-grid,
+        .score-breakdown-grid,
+        .utility-grid,
+        .utility-summary-grid,
+        .staking-summary-grid,
+        .score-card-metrics,
+        .streak-metrics{
+            grid-template-columns:repeat(2,minmax(0,1fr));
+        }
+        .wallet-actions,
+        .header-links{
+            flex-wrap:wrap;
+        }
+    }
+    @media (max-width: 640px){
+        .shell{
+            padding:14px;
+        }
+        .dashboard-brand-banner{
+            width:100%;
+            min-height:72px;
+            border-radius:14px;
+        }
+        .quick-actions,
+        .wallet-grid,
+        .distribution-grid,
+        .summary-grid,
+        .score-breakdown-grid,
+        .utility-grid,
+        .utility-summary-grid,
+        .staking-summary-grid,
+        .score-card-metrics,
+        .streak-metrics{
+            grid-template-columns:1fr;
+        }
+        .wallet-actions{
+            flex-direction:column;
+            align-items:stretch;
+        }
+        .wallet-btn,
+        .wallet-link-button{
+            width:100%;
+            justify-content:center;
+        }
+        .history-panel table{
+            min-width:480px;
+        }
+    }
+        </style>
 """
 
 
@@ -2301,6 +3186,7 @@ def render_page(title, body_html):
             window.EVFI_WEB3_CONFIG = {json.dumps(web3_config)};
         </script>
         <script src="/static/evfi-wallet.js"></script>
+        <script src="/static/evfi-staking.js"></script>
     </body>
     </html>
     """
@@ -2326,10 +3212,320 @@ def is_valid_evm_address(value):
     return isinstance(value, str) and value.startswith("0x") and len(value) == 42
 
 
-def build_demo_assignment_amount(summary):
-    telemetry_score = float(summary["total_miles"] or 0)
-    computed = telemetry_score * EVFI_ASSIGN_RATE
-    return round(max(EVFI_MIN_ASSIGNMENT, computed), 4)
+def verify_admin_or_wallet_signature(expected_wallet=None, expected_action=None, expected_vehicle_id=None):
+    if request.headers.get("x-admin-key") == ADMIN_API_KEY:
+        return True, None
+
+    wallet = str(request.headers.get("x-wallet-address") or "").strip()
+    message = str(request.headers.get("x-wallet-message") or "")
+    signature = str(request.headers.get("x-wallet-signature") or "").strip()
+    if not is_valid_evm_address(wallet) or not message or not signature:
+        return False, "Connect your wallet and approve the EVFi action signature."
+
+    if expected_wallet and wallet.lower() != str(expected_wallet).strip().lower():
+        return False, "Connected wallet does not match the requested recipient wallet."
+
+    expected_lines = [
+        "EVFi wallet action",
+        f"Action: {expected_action}",
+        f"Vehicle: {expected_vehicle_id}",
+        f"Wallet: {wallet}",
+    ]
+    for expected_line in expected_lines:
+        if expected_line not in message:
+            return False, "Wallet signature message does not match this EVFi action."
+
+    message_parts = [part.strip() for part in message.replace("\n", "|").split("|")]
+    timestamp_line = next((line for line in message_parts if line.startswith("Timestamp: ")), "")
+    try:
+        signed_at_ms = int(timestamp_line.split(":", 1)[1].strip())
+    except Exception:
+        return False, "Wallet signature timestamp is missing."
+    if abs((time.time() * 1000) - signed_at_ms) > 15 * 60 * 1000:
+        return False, "Wallet signature expired. Try the action again."
+
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        recovered = Account.recover_message(encode_defunct(text=message), signature=signature)
+    except Exception as exc:
+        try:
+            script = "import('ethers').then(({verifyMessage})=>console.log(verifyMessage(process.argv[1],process.argv[2]))).catch((error)=>{console.error(error.message||error);process.exit(1);})"
+            result = subprocess.run(
+                ["node", "-e", script, message, signature],
+                cwd=APP_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if result.returncode != 0:
+                return False, f"Wallet signature verification failed: {result.stderr.strip() or exc}"
+            recovered = result.stdout.strip()
+        except Exception as fallback_exc:
+            return False, f"Wallet signature verification failed: {fallback_exc}"
+
+    if recovered.lower() != wallet.lower():
+        return False, "Wallet signature does not match the connected wallet."
+    return True, None
+
+
+def build_weekly_reward_preview(user_id, vin, event_vehicle_id):
+    weekly_score = get_current_week_score(user_id, vin) or calculate_weekly_score(user_id, vin, event_vehicle_id)
+    reward_context = estimate_weekly_reward(float(weekly_score["total_score"] or 0.0), weekly_score["week_start"], weekly_score["week_end"])
+    return {
+        "weeklyScore": round(float(weekly_score["total_score"] or 0.0), 2),
+        "estimatedEvfi": round(float(reward_context["estimated_evfi"] or 0.0), 2),
+        "emissionFactor": round(float(reward_context["emission_factor"] or 0.0), 8),
+        "actualNetworkScore": round(float(reward_context["actual_network_score"] or 0.0), 2),
+        "effectiveNetworkScore": round(float(reward_context["effective_network_score"] or 0.0), 2),
+        "weeklyPool": round(float(reward_context["weekly_pool"] or 0.0), 2),
+        "weekStart": int(weekly_score["week_start"] or 0),
+        "weekEnd": int(weekly_score["week_end"] or 0),
+    }
+
+
+def extract_weekly_score_breakdown(weekly_score):
+    breakdown = parse_json_object(weekly_score["score_breakdown_json"] if weekly_score and "score_breakdown_json" in weekly_score.keys() else {})
+    return {
+        "verifiedMiles": round(as_float(breakdown.get("verified_miles"), 0.0), 2),
+        "activeDays": int(breakdown.get("active_days") or 0),
+        "activeDayScore": round(as_float(breakdown.get("active_day_score"), 0.0), 2),
+        "participationBonus": round(as_float(breakdown.get("participation_bonus"), 0.0), 2),
+        "efficiencyScore": round(as_float(breakdown.get("efficiency_score"), 0.0), 2),
+        "chargingScore": round(as_float(breakdown.get("charging_score"), 0.0), 2),
+        "penaltyScore": round(as_float(breakdown.get("penalty_score"), 0.0), 2),
+        "missionBonus": round(as_float(breakdown.get("mission_bonus_applied"), 0.0), 2),
+        "streakMultiplier": round(as_float(breakdown.get("streak_multiplier"), 1.0), 2),
+        "avgEfficiencyWhmi": round(as_float(breakdown.get("avg_efficiency_whmi"), 0.0), 2),
+        "baselineEfficiencyWhmi": round(as_float(breakdown.get("baseline_efficiency_whmi"), 0.0), 2),
+        "healthyChargeSessions": int(breakdown.get("healthy_charge_sessions") or 0),
+        "highSocChargeSessions": int(breakdown.get("high_soc_charge_sessions") or 0),
+        "offpeakChargeSessions": int(breakdown.get("offpeak_charge_sessions") or 0),
+        "acChargeSessions": int(breakdown.get("ac_charge_sessions") or 0),
+        "fastChargeSessions": int(breakdown.get("fast_charge_sessions") or 0),
+        "chargeSessions": int(breakdown.get("charge_sessions") or 0),
+        "preBonusScore": round(as_float(breakdown.get("pre_bonus_score"), 0.0), 2),
+        "stakingBoostPct": round(as_float(breakdown.get("staking_boost_pct"), 0.0), 2),
+        "stakingBonus": round(as_float(breakdown.get("staking_bonus"), 0.0), 2),
+        "totalScore": round(as_float(breakdown.get("total_score"), weekly_score["total_score"] if weekly_score else 0.0), 2),
+    }
+
+
+def build_token_utility_catalog():
+    return {
+        "analyticsUnlocks": [
+            {"key": "premium_weekly_insights", "actionType": "analytics_unlock", "label": "Premium Weekly Insights", "costEvfi": 25, "description": "Unlock expanded efficiency, charging, and streak analysis for the current week."},
+            {"key": "battery_health_report", "actionType": "analytics_unlock", "label": "Battery Health Report", "costEvfi": 40, "description": "Generate a deeper battery stewardship and charging-discipline report."},
+        ],
+        "partnerRewards": [
+            {"key": "charging_credit_pass", "actionType": "partner_reward", "label": "Charging Credit Pass", "costEvfi": 60, "description": "Unlock a digital charging-credit pass preview in your EVFi wallet profile."},
+            {"key": "telemetry_export_pack", "actionType": "partner_reward", "label": "Telemetry Export Pack", "costEvfi": 45, "description": "Unlock digital CSV and PDF export previews for your weekly EVFi telemetry summary."},
+        ],
+        "stakingTiers": [
+            {"key": "bronze", "actionType": "onchain_stake_hint", "label": "Bronze Stake", "stakeEvfi": 100, "rewardBoostPct": 5, "description": "Stake at least 100 EVFi on Sepolia for the Bronze weekly reward boost."},
+            {"key": "silver", "actionType": "onchain_stake_hint", "label": "Silver Stake", "stakeEvfi": 500, "rewardBoostPct": 10, "description": "Stake at least 500 EVFi on Sepolia for the Silver weekly reward boost."},
+            {"key": "gold", "actionType": "onchain_stake_hint", "label": "Gold Stake", "stakeEvfi": 1000, "rewardBoostPct": 15, "description": "Stake at least 1,000 EVFi on Sepolia for the Gold weekly reward boost."},
+        ],
+    }
+
+
+def get_token_utility_entry(action_key):
+    catalog = build_token_utility_catalog()
+    for group in ("analyticsUnlocks", "partnerRewards", "stakingTiers"):
+        for entry in catalog[group]:
+            if entry["key"] == action_key:
+                return dict(entry)
+    return None
+
+
+def get_active_stake_position(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM staking_positions
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_utility_balance(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM gamification_evfi_events
+        WHERE user_id = ?
+          AND source != 'airdrop_claim'
+        """,
+        (user_id,),
+    )
+    total_earned = as_float(cur.fetchone()["total"], 0.0)
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(amount_evfi), 0) AS total
+        FROM utility_actions
+        WHERE user_id = ? AND status = 'completed'
+        """,
+        (user_id,),
+    )
+    total_spent = as_float(cur.fetchone()["total"], 0.0)
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(stake_evfi), 0) AS total
+        FROM staking_positions
+        WHERE user_id = ? AND status = 'active'
+        """,
+        (user_id,),
+    )
+    total_staked = as_float(cur.fetchone()["total"], 0.0)
+    conn.close()
+    available = max(0.0, round(total_earned - total_spent - total_staked, 2))
+    return {
+        "totalEarned": round(total_earned, 2),
+        "totalSpent": round(total_spent, 2),
+        "totalStaked": round(total_staked, 2),
+        "available": available,
+    }
+
+
+def get_user_utility_state(user_id):
+    balance = get_user_utility_balance(user_id)
+    active_stake = get_active_stake_position(user_id)
+    return {
+        "balance": balance,
+        "activeStake": {
+            "tierKey": active_stake["tier_key"],
+            "stakeEvfi": round(as_float(active_stake["stake_evfi"], 0.0), 2),
+            "rewardBoostPct": round(as_float(active_stake["reward_boost_pct"], 0.0), 2),
+            "updatedAt": int(active_stake["updated_at"] or active_stake["created_at"] or 0),
+        } if active_stake else None,
+        "catalog": build_token_utility_catalog(),
+    }
+
+
+def get_active_stake_boost_pct(user_id):
+    active_stake = get_active_stake_position(user_id)
+    if not active_stake:
+        return 0.0
+    return round(as_float(active_stake["reward_boost_pct"], 0.0), 2)
+
+
+def redeem_token_utility(user_id, action_key):
+    entry = get_token_utility_entry(action_key)
+    if not entry or entry.get("actionType") not in ("analytics_unlock", "partner_reward"):
+        raise ValueError("Unknown utility action.")
+    balance = get_user_utility_balance(user_id)
+    cost_evfi = round(as_float(entry.get("costEvfi"), 0.0), 2)
+    if balance["available"] < cost_evfi:
+        raise ValueError("Not enough EVFi utility balance.")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    created_at = now_ts()
+    cur.execute(
+        """
+        INSERT INTO utility_actions
+        (user_id, action_key, action_type, amount_evfi, status, details_json, created_at, completed_at)
+        VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+        """,
+        (
+            user_id,
+            action_key,
+            entry["actionType"],
+            cost_evfi,
+            json.dumps(entry, sort_keys=True),
+            created_at,
+            created_at,
+        ),
+    )
+    conn.commit()
+    action_id = cur.lastrowid
+    conn.close()
+    log_v2_event("utility_redeemed", user_id=user_id, action_key=action_key, amount_evfi=cost_evfi)
+    return {
+        "actionId": int(action_id),
+        "entry": entry,
+        "amountEvfi": cost_evfi,
+        "utilityState": get_user_utility_state(user_id),
+    }
+
+
+def stake_evfi_tier(user_id, tier_key):
+    entry = get_token_utility_entry(tier_key)
+    if not entry or entry.get("actionType") != "stake":
+        raise ValueError("Unknown staking tier.")
+    if get_active_stake_position(user_id):
+        raise ValueError("Unstake the current position before staking a new tier.")
+
+    stake_evfi = round(as_float(entry.get("stakeEvfi"), 0.0), 2)
+    balance = get_user_utility_balance(user_id)
+    if balance["available"] < stake_evfi:
+        raise ValueError("Not enough EVFi utility balance to stake this tier.")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    created_at = now_ts()
+    cur.execute(
+        """
+        INSERT INTO staking_positions
+        (user_id, tier_key, stake_evfi, reward_boost_pct, status, details_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (
+            user_id,
+            tier_key,
+            stake_evfi,
+            round(as_float(entry.get("rewardBoostPct"), 0.0), 2),
+            json.dumps(entry, sort_keys=True),
+            created_at,
+            created_at,
+        ),
+    )
+    conn.commit()
+    position_id = cur.lastrowid
+    conn.close()
+    log_v2_event("stake_activated", user_id=user_id, tier_key=tier_key, stake_evfi=stake_evfi)
+    return {
+        "positionId": int(position_id),
+        "entry": entry,
+        "utilityState": get_user_utility_state(user_id),
+    }
+
+
+def unstake_evfi(user_id):
+    active_stake = get_active_stake_position(user_id)
+    if not active_stake:
+        raise ValueError("No active stake to unstake.")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE staking_positions
+        SET status = 'unstaked',
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (now_ts(), int(active_stake["id"])),
+    )
+    conn.commit()
+    conn.close()
+    log_v2_event("stake_released", user_id=user_id, tier_key=active_stake["tier_key"], stake_evfi=active_stake["stake_evfi"])
+    return {
+        "tierKey": active_stake["tier_key"],
+        "stakeEvfi": round(as_float(active_stake["stake_evfi"], 0.0), 2),
+        "utilityState": get_user_utility_state(user_id),
+    }
 
 
 def build_distribution_batch_id(vid, action="demo"):
@@ -2804,7 +4000,7 @@ def awardEligibleBadges(user_id):
             INSERT INTO gamification_badges (user_id, badge_key, badge_name, badge_asset, awarded_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, badge_key, BADGE_DEFS[badge_key], "/static/evfi-token-logo.png", now_ts()),
+            (user_id, badge_key, BADGE_DEFS[badge_key], "/static/evfi-badge-genesis.svg", now_ts()),
         )
         awarded_now.append({"badgeKey": badge_key, "badgeName": BADGE_DEFS[badge_key]})
 
@@ -2849,6 +4045,18 @@ def processTelemetrySync(user_id, telemetryData):
     charge_rate = telemetryData.get("charge_rate")
     charging_state = telemetryData.get("charging_state")
     efficiency_whmi = telemetryData.get("efficiency_whmi")
+
+    log_v2_event(
+        "telemetry_sync_received",
+        user_id=user_id,
+        previous_odometer=previous_odometer,
+        current_odometer=odometer,
+        telemetry_miles=telemetry_miles,
+        odometer_delta=odometer_delta,
+        miles_added=miles_delta,
+        verified_miles=verified_miles,
+        reward_added=verified_miles,
+    )
 
     activity = updateDailyActivity(user_id, day, "sync")
 
@@ -2903,6 +4111,15 @@ def processTelemetrySync(user_id, telemetryData):
             "efficiency_whmi": efficiency_whmi,
         },
         event_ts=synced_at,
+    )
+    log_v2_event(
+        "telemetry_sync_persisted",
+        user_id=user_id,
+        previous_odometer=previous_odometer,
+        current_odometer=odometer,
+        miles_added=miles_delta,
+        verified_miles=verified_miles,
+        reward_added=verified_miles,
     )
 
     challenges = updateChallengeProgress(user_id, {"verified_miles": verified_miles})
@@ -3037,13 +4254,13 @@ def get_daily_verified_miles(user_id, event_vehicle_id, day_start):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT COALESCE(SUM(miles_added), 0) AS miles
+        SELECT COALESCE(SUM(COALESCE(verified_miles, miles_added)), 0) AS miles
         FROM reward_events
         WHERE user_id = ?
           AND tesla_vehicle_id = ?
           AND synced_at >= ?
           AND synced_at < ?
-          AND miles_added >= ?
+          AND COALESCE(verified_miles, miles_added) >= ?
         """,
         (user_id, event_vehicle_id, day_start, day_end, MINIMUM_TRIP_DISTANCE),
     )
@@ -3078,21 +4295,15 @@ def validate_trip_for_scoring(user_id, event_vehicle_id, miles_added, previous_s
         append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_trip_distance", "vehicleId": event_vehicle_id, "miles": miles_added})
         return 0.0
 
-    duration = synced_at - previous_synced_at if previous_synced_at else MINIMUM_TRIP_DURATION_SECONDS
-    if duration < MIN_SYNC_INTERVAL_SECONDS:
+    duration = synced_at - previous_synced_at if previous_synced_at else None
+    if duration is not None and duration < MIN_SYNC_INTERVAL_SECONDS:
         log_rule_violation("minimum_sync_interval", user_id=user_id, vehicle_id=event_vehicle_id, duration=duration)
         append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_sync_interval", "vehicleId": event_vehicle_id, "duration": duration})
         return 0.0
-    if duration < MINIMUM_TRIP_DURATION_SECONDS:
-        log_rule_violation("minimum_trip_duration", user_id=user_id, vehicle_id=event_vehicle_id, duration=duration)
-        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_trip_duration", "vehicleId": event_vehicle_id, "duration": duration})
-        return 0.0
 
-    average_speed = miles_added / max(duration / 3600, 0.01)
-    if average_speed < MINIMUM_AVERAGE_SPEED:
-        log_rule_violation("minimum_average_speed", user_id=user_id, vehicle_id=event_vehicle_id, average_speed=average_speed)
-        append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "minimum_average_speed", "vehicleId": event_vehicle_id, "average_speed": round(average_speed, 2)})
-        return 0.0
+    # Sync cadence is not trip duration, so only enforce an upper-bound speed check here.
+    effective_duration = duration if duration and duration > 0 else MINIMUM_TRIP_DURATION_SECONDS
+    average_speed = miles_added / max(effective_duration / 3600, 0.01)
     if average_speed > MAX_AVERAGE_SPEED:
         log_rule_violation("max_average_speed", user_id=user_id, vehicle_id=event_vehicle_id, average_speed=average_speed)
         append_gamification_activity(user_id, "telemetry_rejected", "anti_abuse", {"reason": "max_average_speed", "vehicleId": event_vehicle_id, "average_speed": round(average_speed, 2)})
@@ -3112,12 +4323,12 @@ def get_week_verified_miles(user_id, event_vehicle_id, week_start, week_end):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT COALESCE(SUM(miles_added), 0) AS miles
+        SELECT COALESCE(SUM(COALESCE(verified_miles, miles_added)), 0) AS miles
         FROM reward_events
         WHERE user_id = ?
           AND tesla_vehicle_id = ?
           AND synced_at BETWEEN ? AND ?
-          AND miles_added >= ?
+          AND COALESCE(verified_miles, miles_added) >= ?
         """,
         (user_id, event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
     )
@@ -3216,12 +4427,12 @@ def calculate_active_days(user_id, event_vehicle_id, week_start, week_end):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT synced_at, miles_added
+        SELECT synced_at, COALESCE(verified_miles, miles_added) AS verified_miles
         FROM reward_events
         WHERE user_id = ?
           AND tesla_vehicle_id = ?
           AND synced_at BETWEEN ? AND ?
-          AND miles_added >= ?
+          AND COALESCE(verified_miles, miles_added) >= ?
         """,
         (user_id, event_vehicle_id, week_start, week_end, MINIMUM_TRIP_DISTANCE),
     )
@@ -3242,33 +4453,299 @@ def calculate_streak_multiplier(active_days):
     return 1.0
 
 
-def update_missions(user_id, verified_miles, active_days, charge_health_score):
+def get_week_sync_metrics(user_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            COUNT(*) AS sync_events,
+            COUNT(DISTINCT strftime('%Y-%m-%d', synced_at, 'unixepoch', 'localtime')) AS sync_days,
+            AVG(CASE WHEN efficiency_whmi IS NOT NULL AND efficiency_whmi > 0 THEN efficiency_whmi END) AS avg_efficiency_whmi,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) IN ('charging', 'complete') THEN 1 ELSE 0 END) AS charging_events,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) = 'charging' AND battery_level BETWEEN 20 AND 80 THEN 1 ELSE 0 END) AS healthy_charge_sessions,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) IN ('charging', 'complete') AND battery_level >= 95 THEN 1 ELSE 0 END) AS high_soc_charge_sessions,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) = 'charging' AND (CAST(strftime('%H', synced_at, 'unixepoch', 'localtime') AS INTEGER) >= 22 OR CAST(strftime('%H', synced_at, 'unixepoch', 'localtime') AS INTEGER) < 6) THEN 1 ELSE 0 END) AS offpeak_charge_sessions,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) = 'charging' AND charge_rate IS NOT NULL AND charge_rate > 0 AND charge_rate <= 19.5 THEN 1 ELSE 0 END) AS ac_charge_sessions,
+            SUM(CASE WHEN charging_state IS NOT NULL AND lower(charging_state) = 'charging' AND charge_rate IS NOT NULL AND charge_rate >= 45 THEN 1 ELSE 0 END) AS fast_charge_sessions
+        FROM gamification_sync_history
+        WHERE user_id = ?
+          AND synced_at BETWEEN ? AND ?
+        """,
+        (user_id, week_start, week_end),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else {
+        "sync_events": 0,
+        "sync_days": 0,
+        "avg_efficiency_whmi": None,
+        "charging_events": 0,
+        "healthy_charge_sessions": 0,
+        "high_soc_charge_sessions": 0,
+        "offpeak_charge_sessions": 0,
+        "ac_charge_sessions": 0,
+        "fast_charge_sessions": 0,
+    }
+
+
+def infer_week_charge_sessions(user_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM charge_sessions
+        WHERE user_id = ?
+          AND session_end_ts >= ?
+          AND session_start_ts <= ?
+        ORDER BY session_start_ts ASC, id ASC
+        """,
+        (user_id, week_start, week_end),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "startTs": int(row["session_start_ts"] or 0),
+            "endTs": int(row["session_end_ts"] or 0),
+            "lastSyncedAt": int(row["last_synced_at"] or row["session_end_ts"] or 0),
+            "startBattery": as_float(row["start_battery"], 0.0),
+            "endBattery": as_float(row["end_battery"], 0.0),
+            "maxBattery": as_float(row["max_battery"], 0.0),
+            "snapshotCount": int(row["snapshot_count"] or 0),
+            "avgChargeRate": as_float(row["avg_charge_rate"], 0.0),
+            "maxChargeRate": as_float(row["max_charge_rate"], 0.0),
+            "offpeak": bool(int(row["offpeak"] or 0)),
+            "healthy": bool(int(row["healthy"] or 0)),
+            "highSoc": bool(int(row["high_soc"] or 0)),
+            "acCharge": bool(int(row["ac_charge"] or 0)),
+            "fastCharge": bool(int(row["fast_charge"] or 0)),
+            "sessionHours": round(max(0.0, (int(row["session_end_ts"] or 0) - int(row["session_start_ts"] or 0)) / 3600), 2),
+        }
+        for row in rows
+    ]
+
+
+def get_efficiency_baseline(user_id, before_ts):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT AVG(efficiency_whmi) AS baseline_efficiency
+        FROM gamification_sync_history
+        WHERE user_id = ?
+          AND synced_at < ?
+          AND efficiency_whmi IS NOT NULL
+          AND efficiency_whmi > 0
+        """,
+        (user_id, before_ts),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return as_float(row["baseline_efficiency"] if row else 0.0, 0.0)
+
+
+def get_week_penalty_points(user_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM gamification_activity_feed
+        WHERE user_id = ?
+          AND created_at BETWEEN ? AND ?
+          AND event_type IN ('telemetry_rejected', 'telemetry_capped')
+        """,
+        (user_id, week_start, week_end),
+    )
+    count = int(cur.fetchone()["total"] or 0)
+    conn.close()
+    return round(count * TELEMETRY_REJECTION_PENALTY, 2)
+
+
+def compute_efficiency_score(avg_efficiency_whmi, baseline_efficiency_whmi):
+    avg_efficiency = as_float(avg_efficiency_whmi, 0.0)
+    baseline_efficiency = as_float(baseline_efficiency_whmi, 0.0)
+    if avg_efficiency <= 0 or baseline_efficiency <= 0:
+        return 0.0
+    improvement_ratio = (baseline_efficiency - avg_efficiency) / baseline_efficiency
+    raw_score = improvement_ratio * 200.0
+    return round(max(-EFFICIENCY_PENALTY_CAP, min(EFFICIENCY_BONUS_CAP, raw_score)), 2)
+
+
+def summarize_charge_sessions(charge_sessions):
+    healthy_charge_sessions = sum(1 for session in charge_sessions if session.get("healthy"))
+    high_soc_charge_sessions = sum(1 for session in charge_sessions if session.get("highSoc"))
+    offpeak_charge_sessions = sum(1 for session in charge_sessions if session.get("offpeak"))
+    ac_charge_sessions = sum(1 for session in charge_sessions if session.get("acCharge"))
+    fast_charge_sessions = sum(1 for session in charge_sessions if session.get("fastCharge"))
+    return {
+        "session_count": len(charge_sessions),
+        "healthy_charge_sessions": healthy_charge_sessions,
+        "high_soc_charge_sessions": high_soc_charge_sessions,
+        "offpeak_charge_sessions": offpeak_charge_sessions,
+        "ac_charge_sessions": ac_charge_sessions,
+        "fast_charge_sessions": fast_charge_sessions,
+    }
+
+
+def compute_charging_score(charge_session_summary):
+    healthy_charge_sessions = int(charge_session_summary.get("healthy_charge_sessions") or 0)
+    high_soc_charge_sessions = int(charge_session_summary.get("high_soc_charge_sessions") or 0)
+    offpeak_charge_sessions = int(charge_session_summary.get("offpeak_charge_sessions") or 0)
+    ac_charge_sessions = int(charge_session_summary.get("ac_charge_sessions") or 0)
+    fast_charge_sessions = int(charge_session_summary.get("fast_charge_sessions") or 0)
+    healthy_points = min(HEALTHY_CHARGE_SCORE_CAP, healthy_charge_sessions * HEALTHY_CHARGE_SESSION_POINTS)
+    offpeak_points = min(OFFPEAK_CHARGE_SCORE_CAP, offpeak_charge_sessions * OFFPEAK_CHARGE_SESSION_POINTS)
+    ac_points = min(AC_CHARGE_SCORE_CAP, ac_charge_sessions * AC_CHARGE_SESSION_POINTS)
+    high_soc_penalty = high_soc_charge_sessions * HIGH_SOC_CHARGE_PENALTY
+    fast_charge_penalty = min(FAST_CHARGE_PENALTY_CAP, fast_charge_sessions * FAST_CHARGE_SESSION_PENALTY)
+    total = healthy_points + offpeak_points + ac_points - high_soc_penalty - fast_charge_penalty
+    return round(max(0.0, total), 2)
+
+
+def compute_participation_bonus(sync_metrics):
+    sync_events = int(sync_metrics.get("sync_events") or 0)
+    return round(min(SYNC_PARTICIPATION_CAP, sync_events * SYNC_PARTICIPATION_POINTS), 2)
+
+
+def build_weekly_score_breakdown(user_id, event_vehicle_id, week_start, week_end):
+    verified_miles = get_week_verified_miles(user_id, event_vehicle_id, week_start, week_end)
+    active_days = calculate_active_days(user_id, event_vehicle_id, week_start, week_end)
+    streak_multiplier = calculate_streak_multiplier(active_days)
+    sync_metrics = get_week_sync_metrics(user_id, week_start, week_end)
+    charge_sessions = infer_week_charge_sessions(user_id, week_start, week_end)
+    charge_session_summary = summarize_charge_sessions(charge_sessions)
+    baseline_efficiency = get_efficiency_baseline(user_id, week_start)
+    avg_efficiency = as_float(sync_metrics.get("avg_efficiency_whmi"), 0.0)
+    efficiency_score = compute_efficiency_score(avg_efficiency, baseline_efficiency)
+    charging_score = compute_charging_score(charge_session_summary)
+    participation_bonus = compute_participation_bonus(sync_metrics)
+    penalty_score = get_week_penalty_points(user_id, week_start, week_end)
+    active_day_score = float(active_days * 25)
+    pre_multiplier_score = verified_miles + active_day_score + efficiency_score + charging_score + participation_bonus
+    post_multiplier_score = max(0.0, round(pre_multiplier_score * streak_multiplier, 2))
+    pre_bonus_score = max(0.0, round(post_multiplier_score - penalty_score, 2))
+    return {
+        "verified_miles": round(float(verified_miles), 2),
+        "active_days": int(active_days),
+        "active_day_score": round(active_day_score, 2),
+        "streak_multiplier": float(streak_multiplier),
+        "sync_events": int(sync_metrics.get("sync_events") or 0),
+        "sync_days": int(sync_metrics.get("sync_days") or 0),
+        "participation_bonus": participation_bonus,
+        "avg_efficiency_whmi": round(avg_efficiency, 2) if avg_efficiency > 0 else 0.0,
+        "baseline_efficiency_whmi": round(baseline_efficiency, 2) if baseline_efficiency > 0 else 0.0,
+        "efficiency_score": efficiency_score,
+        "charging_events": int(sync_metrics.get("charging_events") or 0),
+        "charge_sessions": int(charge_session_summary.get("session_count") or 0),
+        "healthy_charge_sessions": int(charge_session_summary.get("healthy_charge_sessions") or 0),
+        "high_soc_charge_sessions": int(charge_session_summary.get("high_soc_charge_sessions") or 0),
+        "offpeak_charge_sessions": int(charge_session_summary.get("offpeak_charge_sessions") or 0),
+        "ac_charge_sessions": int(charge_session_summary.get("ac_charge_sessions") or 0),
+        "fast_charge_sessions": int(charge_session_summary.get("fast_charge_sessions") or 0),
+        "charging_score": charging_score,
+        "penalty_score": penalty_score,
+        "pre_multiplier_score": round(pre_multiplier_score, 2),
+        "post_multiplier_score": post_multiplier_score,
+        "pre_bonus_score": pre_bonus_score,
+    }
+
+
+def build_weekly_reward_explanations(score_breakdown, reward_preview):
+    explanations = []
+    if as_float(score_breakdown.get("verified_miles"), 0.0) > 0:
+        explanations.append(f'Verified driving contributed {fmt2(score_breakdown.get("verified_miles"))} score from real miles synced this week.')
+    else:
+        explanations.append("No verified driving miles have counted yet this week, so the score is relying on supporting behavior only.")
+
+    if int(score_breakdown.get("active_days") or 0) > 0:
+        explanations.append(f'Activity across {int(score_breakdown.get("active_days") or 0)} day(s) added {fmt2(score_breakdown.get("active_day_score"))} score and a {score_breakdown.get("streak_multiplier", 1.0):.2f}x streak multiplier.')
+
+    if as_float(score_breakdown.get("charging_score"), 0.0) > 0:
+        explanations.append(
+            f'Charging behavior added {fmt2(score_breakdown.get("charging_score"))} score from '
+            f'{int(score_breakdown.get("charge_sessions") or 0)} inferred session(s), including '
+            f'{int(score_breakdown.get("healthy_charge_sessions") or 0)} healthy, '
+            f'{int(score_breakdown.get("offpeak_charge_sessions") or 0)} off-peak, and '
+            f'{int(score_breakdown.get("ac_charge_sessions") or 0)} AC charging session(s).'
+        )
+
+    if int(score_breakdown.get("fast_charge_sessions") or 0) > 0 or int(score_breakdown.get("high_soc_charge_sessions") or 0) > 0:
+        explanations.append(
+            f'Charging penalties reflect {int(score_breakdown.get("fast_charge_sessions") or 0)} fast-charge and '
+            f'{int(score_breakdown.get("high_soc_charge_sessions") or 0)} high-SoC charging snapshot(s).'
+        )
+
+    efficiency_score = as_float(score_breakdown.get("efficiency_score"), 0.0)
+    if efficiency_score > 0:
+        explanations.append(
+            f'Efficiency improved against your baseline: {fmt2(score_breakdown.get("avg_efficiency_whmi"))} Wh/mi versus {fmt2(score_breakdown.get("baseline_efficiency_whmi"))} baseline.'
+        )
+    elif efficiency_score < 0:
+        explanations.append(
+            f'Efficiency underperformed your baseline this week: {fmt2(score_breakdown.get("avg_efficiency_whmi"))} Wh/mi versus {fmt2(score_breakdown.get("baseline_efficiency_whmi"))}.'
+        )
+
+    if as_float(score_breakdown.get("penalty_score"), 0.0) > 0:
+        explanations.append(f'Anti-abuse or capped telemetry events reduced score by {fmt2(score_breakdown.get("penalty_score"))}.')
+
+    if as_float(score_breakdown.get("mission_bonus"), 0.0) > 0:
+        explanations.append(f'Missions added {fmt2(score_breakdown.get("mission_bonus"))} score after the weekly mission cap was applied.')
+
+    if as_float(score_breakdown.get("staking_bonus"), 0.0) > 0:
+        explanations.append(
+            f'Your active staking tier added a {score_breakdown.get("staking_boost_pct", 0):.2f}% boost worth {fmt2(score_breakdown.get("staking_bonus"))} score.'
+        )
+
+    explanations.append(
+        f'The current emission factor is {reward_preview["emissionFactor"]:.6f}, producing an estimated {fmt2(reward_preview["estimatedEvfi"])} EVFi for the week.'
+    )
+    return explanations[:6]
+
+
+def update_missions(user_id, score_breakdown):
     ensure_weekly_reset(user_id)
-    upsert_mission(user_id, "sync_vehicle", 1, True)
+    verified_miles = as_float(score_breakdown.get("verified_miles"), 0.0)
+    active_days = int(score_breakdown.get("active_days") or 0)
+    sync_events = int(score_breakdown.get("sync_events") or 0)
+    healthy_charge_sessions = int(score_breakdown.get("healthy_charge_sessions") or 0)
+    efficiency_score = as_float(score_breakdown.get("efficiency_score"), 0.0)
+
+    upsert_mission(user_id, "sync_vehicle", min(sync_events, 1), sync_events >= 1)
     upsert_mission(user_id, "drive_once_today", 1 if verified_miles >= MINIMUM_TRIP_DISTANCE else 0, verified_miles >= MINIMUM_TRIP_DISTANCE)
-    upsert_mission(user_id, "efficient_trip", 1 if charge_health_score >= 100 else 0, charge_health_score >= 100)
+    upsert_mission(user_id, "efficient_trip", max(0.0, efficiency_score), efficiency_score > 0)
     upsert_mission(user_id, "drive_on_5_days", active_days, active_days >= 5)
-    upsert_mission(user_id, "complete_3_healthy_charges", 1 if charge_health_score >= 100 else 0, False)
+    upsert_mission(user_id, "complete_3_healthy_charges", healthy_charge_sessions, healthy_charge_sessions >= 3)
     upsert_mission(user_id, "stay_active_all_week", active_days, active_days >= 7)
 
 
 def calculate_weekly_score(user_id, vin, event_vehicle_id, charge_health_score=100.0):
     week_start, week_end = current_week_bounds()
-    verified_miles = get_week_verified_miles(user_id, event_vehicle_id, week_start, week_end)
-    active_days = calculate_active_days(user_id, event_vehicle_id, week_start, week_end)
-    streak_multiplier = calculate_streak_multiplier(active_days)
-    update_missions(user_id, verified_miles, active_days, charge_health_score)
-    mission_bonus = get_completed_mission_bonus(user_id)
-    base_score = float(verified_miles) + float(active_days * 25) + float(charge_health_score)
-    total_score = round((base_score * streak_multiplier) + mission_bonus, 2)
+    score_breakdown = build_weekly_score_breakdown(user_id, event_vehicle_id, week_start, week_end)
+    update_missions(user_id, score_breakdown)
+    mission_bonus_raw = get_completed_mission_bonus(user_id)
+    mission_bonus_cap = round(score_breakdown["pre_bonus_score"] * MISSION_BONUS_CAP_SHARE, 2)
+    mission_bonus = round(min(mission_bonus_raw, mission_bonus_cap), 2)
+    pre_stake_score = round(max(0.0, score_breakdown["pre_bonus_score"] + mission_bonus), 2)
+    staking_boost_pct = get_active_stake_boost_pct(user_id)
+    staking_bonus = round(pre_stake_score * (staking_boost_pct / 100.0), 2)
+    total_score = round(max(0.0, pre_stake_score + staking_bonus), 2)
+    score_breakdown["mission_bonus_raw"] = round(mission_bonus_raw, 2)
+    score_breakdown["mission_bonus_cap"] = mission_bonus_cap
+    score_breakdown["mission_bonus_applied"] = mission_bonus
+    score_breakdown["staking_boost_pct"] = staking_boost_pct
+    score_breakdown["staking_bonus"] = staking_bonus
+    score_breakdown["total_score"] = total_score
 
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO weekly_scores
-        (user_id, vin, week_start, week_end, verified_miles, active_days, charge_health_score, streak_multiplier, mission_bonus, total_score, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, vin, week_start, week_end, verified_miles, active_days, charge_health_score, streak_multiplier, mission_bonus, total_score, created_at, score_breakdown_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, vin, week_start) DO UPDATE SET
             week_end = excluded.week_end,
             verified_miles = excluded.verified_miles,
@@ -3277,20 +4754,22 @@ def calculate_weekly_score(user_id, vin, event_vehicle_id, charge_health_score=1
             streak_multiplier = excluded.streak_multiplier,
             mission_bonus = excluded.mission_bonus,
             total_score = excluded.total_score,
-            created_at = excluded.created_at
+            created_at = excluded.created_at,
+            score_breakdown_json = excluded.score_breakdown_json
         """,
         (
             user_id,
             vin,
             week_start,
             week_end,
-            verified_miles,
-            active_days,
-            charge_health_score,
-            streak_multiplier,
+            score_breakdown["verified_miles"],
+            score_breakdown["active_days"],
+            score_breakdown["charging_score"],
+            score_breakdown["streak_multiplier"],
             mission_bonus,
             total_score,
             now_ts(),
+            json.dumps(score_breakdown, sort_keys=True),
         ),
     )
     conn.commit()
@@ -3317,7 +4796,7 @@ def get_current_week_score(user_id, vin):
     return row
 
 
-def distribute_weekly_pool(user_id, week_start, week_end):
+def calculate_weekly_emission_factor(week_start, week_end):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -3325,23 +4804,46 @@ def distribute_weekly_pool(user_id, week_start, week_end):
         (week_start, week_end),
     )
     total_score = float(cur.fetchone()["total_score"] or 0)
+    conn.close()
+    effective_network_score = max(total_score, WEEKLY_SCORE_BOOTSTRAP_FLOOR)
+    weekly_pool = float(WEEKLY_REWARD_POOL)
+    emission_factor = 0.0 if effective_network_score <= 0 else weekly_pool / effective_network_score
+    return {
+        "actual_network_score": round(total_score, 2),
+        "effective_network_score": round(effective_network_score, 2),
+        "weekly_pool": round(weekly_pool, 2),
+        "emission_factor": round(emission_factor, 8),
+    }
+
+
+def estimate_weekly_reward(score_value, week_start, week_end):
+    context = calculate_weekly_emission_factor(week_start, week_end)
+    allocated = round(min(float(score_value or 0.0) * context["emission_factor"], MAX_WEEKLY_EVFI), 2)
+    context["estimated_evfi"] = allocated
+    return context
+
+
+def distribute_weekly_pool(user_id, week_start, week_end):
+    conn = get_db_connection()
+    cur = conn.cursor()
     cur.execute(
         "SELECT COALESCE(SUM(total_score), 0) AS score FROM weekly_scores WHERE user_id = ? AND week_start = ? AND week_end = ?",
         (user_id, week_start, week_end),
     )
     user_score = float(cur.fetchone()["score"] or 0)
-    weekly_pool = float(WEEKLY_REWARD_POOL)
-    allocated = 0.0 if total_score <= 0 else weekly_pool * (user_score / total_score)
-    allocated = round(min(allocated, MAX_WEEKLY_EVFI), 2)
+    allocation_context = estimate_weekly_reward(user_score, week_start, week_end)
+    allocated = allocation_context["estimated_evfi"]
     cur.execute(
         """
-        INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at)
-        VALUES (?, ?, ?, ?, ?, 0, NULL)
+        INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at, reward_type, allocation_context_json)
+        VALUES (?, ?, ?, ?, ?, 0, NULL, 'weekly', ?)
         ON CONFLICT(user_id, week_start, week_end) DO UPDATE SET
             score = excluded.score,
-            evfi_allocated = excluded.evfi_allocated
+            evfi_allocated = excluded.evfi_allocated,
+            reward_type = excluded.reward_type,
+            allocation_context_json = excluded.allocation_context_json
         """,
-        (user_id, week_start, week_end, user_score, allocated),
+        (user_id, week_start, week_end, user_score, allocated, json.dumps(allocation_context, sort_keys=True)),
     )
     conn.commit()
     cur.execute(
@@ -3350,14 +4852,14 @@ def distribute_weekly_pool(user_id, week_start, week_end):
     )
     claim = cur.fetchone()
     conn.close()
-    log_v2_event("distribution", user_id=user_id, week_start=week_start, score=user_score, evfi_allocated=allocated)
+    log_v2_event("distribution", user_id=user_id, week_start=week_start, score=user_score, evfi_allocated=allocated, **allocation_context)
     return claim
 
 
 def get_last_distribution(user_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM claims WHERE user_id = ? ORDER BY week_start DESC, id DESC LIMIT 1", (user_id,))
+    cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start > 0 ORDER BY week_start DESC, id DESC LIMIT 1", (user_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -3400,7 +4902,7 @@ def get_user_missions(user_id):
                 "progress": round(progress_ratio * 100.0, 2),
                 "completed": 1 if completed else 0,
                 "completed_at": row["completed_at"] if row else None,
-                "badge_asset": "/static/evfi-token-logo.png" if completed else None,
+                "badge_asset": "/static/evfi-badge-genesis.svg" if completed else None,
             }
         )
     conn.close()
@@ -3412,18 +4914,50 @@ def ensure_airdrop_claim(user_id, total_miles):
     cur = conn.cursor()
     cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
     claim = cur.fetchone()
+    onboarding_amount = round(float(ONBOARDING_AIRDROP_EVFI), 2)
+    allocation_context = {
+        "reward_bucket": "onboarding_airdrop",
+        "fixed_amount_evfi": onboarding_amount,
+        "qualifying_total_miles": round(float(total_miles or 0.0), 2),
+    }
     if claim is None:
         cur.execute(
             """
-            INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at)
-            VALUES (?, 0, 0, ?, ?, 0, NULL)
+            INSERT INTO claims (user_id, week_start, week_end, score, evfi_allocated, claimed, claimed_at, reward_type, allocation_context_json)
+            VALUES (?, 0, 0, ?, ?, 0, NULL, 'airdrop', ?)
             """,
-            (user_id, total_miles, round(float(total_miles), 2)),
+            (user_id, round(float(total_miles or 0.0), 2), onboarding_amount, json.dumps(allocation_context, sort_keys=True)),
         )
         conn.commit()
         cur.execute("SELECT * FROM claims WHERE user_id = ? AND week_start = 0 AND week_end = 0", (user_id,))
         claim = cur.fetchone()
-        log_v2_event("airdrop_available", user_id=user_id, amount=total_miles)
+        log_v2_event("airdrop_available", user_id=user_id, amount=onboarding_amount, qualifying_total_miles=total_miles)
+    else:
+        if int(claim["claimed"] or 0) == 0:
+            cur.execute(
+                """
+                UPDATE claims
+                SET score = ?,
+                    evfi_allocated = ?,
+                    reward_type = 'airdrop',
+                    allocation_context_json = ?
+                WHERE id = ?
+                """,
+                (round(float(total_miles or 0.0), 2), onboarding_amount, json.dumps(allocation_context, sort_keys=True), int(claim["id"])),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE claims
+                SET reward_type = 'airdrop',
+                    allocation_context_json = ?
+                WHERE id = ?
+                """,
+                (json.dumps(allocation_context, sort_keys=True), int(claim["id"])),
+            )
+        conn.commit()
+        cur.execute("SELECT * FROM claims WHERE id = ?", (int(claim["id"]),))
+        claim = cur.fetchone()
     allocated = round(float(claim["evfi_allocated"] or 0.0), 2)
     conn.close()
     record_evfi_earning(user_id, f"airdrop-allocation:{user_id}", allocated, "airdrop_allocation")
@@ -3471,7 +5005,7 @@ def assign_demo_reward_onchain(wallet_address, amount_tokens, batch_id):
     if not is_valid_evm_address(wallet_address):
         raise ValueError("A valid wallet address is required")
     if not EVFI_REWARDS_ADDRESS or not EVFI_TOKEN_ADDRESS:
-        raise ValueError("EVFI contract addresses are not configured")
+        raise ValueError("EVFi contract addresses are not configured")
 
     command = [
         "cmd",
@@ -3525,7 +5059,7 @@ def mint_airdrop_onchain(wallet_address, amount_tokens, batch_id):
     if not is_valid_evm_address(wallet_address):
         raise ValueError("A valid wallet address is required")
     if not EVFI_TOKEN_ADDRESS:
-        raise ValueError("EVFI token address is not configured")
+        raise ValueError("EVFi token address is not configured")
 
     command = [
         "cmd",
@@ -3771,12 +5305,13 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
 
         cur.execute("""
             INSERT INTO reward_events
-            (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (user_id, tesla_vehicle_id, odometer_reading, miles_added, verified_miles, drv_earned, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             user["id"],
             str(vid),
             current_odometer,
+            0,
             0,
             0,
             now_ts
@@ -3831,6 +5366,16 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
             )
         miles_delta = float(miles_added)
         verified_miles = 0.0 if not should_process_telemetry else validate_trip_for_scoring(user["id"], str(vid), miles_added, previous_synced_at, now_ts)
+        log_v2_event(
+            "reward_sync_delta",
+            user_id=user["id"],
+            vehicle_id=str(vid),
+            previous_odometer=previous_latest,
+            current_odometer=current_odometer,
+            miles_added=miles_delta,
+            verified_miles=verified_miles,
+            reward_added=verified_miles,
+        )
 
         total_miles = current_odometer - baseline
         if total_miles < 0:
@@ -3860,12 +5405,13 @@ def sync_vehicle_rewards(vid, display_name, vin, current_odometer, wallet_addres
         if should_process_telemetry:
             cur.execute("""
                 INSERT INTO reward_events
-                (user_id, tesla_vehicle_id, odometer_reading, miles_added, drv_earned, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (user_id, tesla_vehicle_id, odometer_reading, miles_added, verified_miles, drv_earned, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 user["id"],
                 str(vid),
                 current_odometer,
+                miles_delta,
                 verified_miles,
                 verified_miles,
                 now_ts
@@ -3914,6 +5460,68 @@ def get_recent_reward_events(vid, limit=10):
     return rows
 
 
+def get_cached_vehicle_reward_context(vid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM vehicle_rewards WHERE tesla_vehicle_id = ?", (str(vid),))
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        raise ValueError("Vehicle reward context not found")
+    return row
+
+
+def serialize_reward_event(row):
+    return {
+        "syncedAt": int(row["synced_at"] or 0),
+        "syncedAtLabel": fmt_ts(row["synced_at"]),
+        "odometer": as_float(row["odometer_reading"], 0.0),
+        "milesAdded": as_float(row["miles_added"], 0.0),
+        "verifiedMiles": as_float(row["verified_miles"] if "verified_miles" in row.keys() else row["miles_added"], 0.0),
+        "scoreAdded": as_float(row["drv_earned"], 0.0),
+    }
+
+
+def build_dashboard_sync_payload(vid, wallet, context):
+    user = get_or_create_user(wallet)
+    summary = context["summary"]
+    weekly_score = get_current_week_score(user["id"], context["vin"]) or calculate_weekly_score(user["id"], context["vin"], str(vid))
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], context["vin"], str(vid))
+    weekly_score_breakdown = extract_weekly_score_breakdown(weekly_score)
+    weekly_score_explanations = build_weekly_reward_explanations(parse_json_object(weekly_score["score_breakdown_json"] if weekly_score and "score_breakdown_json" in weekly_score.keys() else {}), weekly_reward_preview)
+    token_utility = get_user_utility_state(user["id"])
+    charge_policy = build_charge_policy_summary()
+    gamification = getGamificationState(user["id"])
+    airdrop_claim = ensure_airdrop_claim(user["id"], context["odometer"])
+    events = [serialize_reward_event(row) for row in get_recent_reward_events(vid)]
+    return {
+        "ok": True,
+        "vehicleId": str(vid),
+        "wallet": wallet,
+        "odometer": as_float(context["odometer"], 0.0),
+        "summary": {
+            "telemetryScore": as_float(weekly_reward_preview["weeklyScore"], 0.0),
+            "totalMiles": as_float(summary["total_miles"], 0.0),
+            "lastSyncedAt": int(summary["last_synced_at"] or 0),
+            "lastSyncedLabel": fmt_ts(summary["last_synced_at"]),
+            "recommendedAssignment": as_float(weekly_reward_preview["estimatedEvfi"], 0.0),
+            "airdropAmount": as_float(airdrop_claim["evfi_allocated"] if airdrop_claim else context["odometer"], 0.0),
+            "emissionFactor": as_float(weekly_reward_preview["emissionFactor"], 0.0),
+        },
+        "weeklyScore": {
+            "totalScore": as_float(weekly_score["total_score"] if weekly_score else 0.0, 0.0),
+            "updatedAt": int((weekly_score["created_at"] if weekly_score else 0) or 0),
+            "updatedAtLabel": fmt_ts(weekly_score["created_at"] if weekly_score else 0),
+            "breakdown": weekly_score_breakdown,
+            "explanations": weekly_score_explanations,
+        },
+        "chargePolicy": charge_policy,
+        "tokenUtility": token_utility,
+        "events": events,
+        "gamification": gamification,
+    }
+
+
 # =========================================================
 # ROUTES
 # =========================================================
@@ -3933,8 +5541,8 @@ def index():
         <section class="hero pre-auth-info">
             <div class="pre-auth-copy">
                 <div class="badge">EvFi Phase 1</div>
-                <h1>Connect Tesla telemetry to EVFI rewards.</h1>
-                <p>Use live Tesla odometer data as the offchain score engine, then connect a Sepolia wallet to view and claim real EVFI rewards.</p>
+                <h1>Connect Tesla telemetry to EVFi rewards.</h1>
+                <p>Use live Tesla odometer data as the offchain score engine, then connect a Sepolia wallet to view and claim real EVFi rewards.</p>
             </div>
             <div class="pre-auth-actions">
                 <a class="btn btn-primary" href="{url}">Login with Tesla</a>
@@ -4107,12 +5715,16 @@ def dashboard(vid):
     time_to_full_charge = vehicle_info.get("charge_state", {}).get("time_to_full_charge", None)
 
     summary = get_reward_summary_for_vehicle(vid, display_name, vin, current_odometer)
-    events = get_recent_reward_events(vid)
+    events = get_recent_reward_events(vid, limit=5)
     user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
     user = expire_sport_mode(user["id"])
     activity = record_app_activity(user["id"], "reward_check")
     gamification = getGamificationState(user["id"])
     weekly_score = get_current_week_score(user["id"], vin) or calculate_weekly_score(user["id"], vin, str(vid))
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], vin, str(vid))
+    weekly_score_breakdown = extract_weekly_score_breakdown(weekly_score)
+    weekly_score_explanations = build_weekly_reward_explanations(parse_json_object(weekly_score["score_breakdown_json"] if weekly_score and "score_breakdown_json" in weekly_score.keys() else {}), weekly_reward_preview)
+    token_utility = get_user_utility_state(user["id"])
     missions = get_user_missions(user["id"])
     last_distribution = get_last_distribution(user["id"])
     airdrop_claim = ensure_airdrop_claim(user["id"], current_odometer)
@@ -4135,6 +5747,9 @@ def dashboard(vid):
     battery_icon_width = max(8, min(charge_level, 100))
 
     vehicle_image_url = get_vehicle_image_url()
+    display_wheel_type = "18-inch Aero Wheels" if str(wheel_type).strip().lower() == "pinwheelrefresh18" else str(wheel_type)
+    staking_contract_address = os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip()
+    generated_fees_pool_address = os.getenv("GENERATED_FEES_POOL_ADDRESS", "").strip()
 
     if vehicle_image_url:
         car_visual_html = f"""
@@ -4185,7 +5800,8 @@ def dashboard(vid):
     distribution_updated_str = fmt_ts(last_distribution["claimed_at"] if last_distribution and last_distribution["claimed_at"] else (last_distribution["week_end"] if last_distribution else None))
     last_distribution_value = fmt2_grouped(last_distribution["evfi_allocated"] if last_distribution else 0)
     airdrop_status = "Airdrop Claimed" if airdrop_claim and airdrop_claim["claimed"] else "Airdrop Available"
-    airdrop_amount = fmt2(airdrop_claim["evfi_allocated"] if airdrop_claim else current_odometer)
+    airdrop_amount = fmt2(airdrop_claim["evfi_allocated"] if airdrop_claim else ONBOARDING_AIRDROP_EVFI)
+    weekly_reward_estimate = fmt2_grouped(weekly_reward_preview["estimatedEvfi"])
     badge_label = "No badge earned yet"
     badge_asset = "/static/evfi-badge-genesis.svg"
     latest_badge = gamification["badges"][0] if gamification["badges"] else None
@@ -4218,49 +5834,76 @@ def dashboard(vid):
     if not mission_rows:
         mission_rows = "<div class='sub'>Sync the vehicle to start missions.</div>"
 
-    activity_rows = ""
-    activity_name_map = {
-        "daily_activity": "Daily Activity",
-        "streak_increased": "Streak Increased",
-        "streak_reset": "Streak Reset",
-        "telemetry_sync": "Telemetry Sync",
-        "telemetry_rejected": "Telemetry Rejected",
-        "telemetry_capped": "Telemetry Capped",
-        "challenge_progress": "Challenge Progress",
-        "challenge_completed": "Challenge Completed",
-        "challenge_window_rollover": "Challenge Rollover",
-        "badge_awarded": "Badge Awarded",
-        "evfi_earned": "EVFI Earned",
-    }
-    for event in gamification.get("activityFeed", []):
-        event_type = str(event.get("event_type") or "event")
-        event_label = activity_name_map.get(event_type, event_type.replace("_", " ").title())
-        source = str(event.get("source") or "system")
-        created_at = fmt_ts(event.get("created_at"))
-        details = event.get("details") or {}
-        detail_bits = []
-        for key in ("reason", "challengeKey", "badgeName", "delta", "miles_delta", "verified_miles", "currentStreak"):
-            if key in details and details[key] is not None:
-                detail_bits.append(f"{key}: {details[key]}")
-        if not detail_bits and isinstance(details, dict):
-            for key, value in list(details.items())[:3]:
-                if value is not None:
-                    detail_bits.append(f"{key}: {value}")
-        details_text = escape(" | ".join(str(bit) for bit in detail_bits)) if detail_bits else "No extra details."
-        activity_rows += f"""
-        <div class="activity-item">
-            <div class="activity-head">
-                <div class="activity-type">{escape(event_label)}</div>
-                <div class="activity-time">{escape(created_at)}</div>
+    completed_missions = [mission for mission in missions if bool(mission["completed"])]
+    achievement_badge_html = "".join(
+        f"""
+        <div class="achievement-badge">
+            <img src="/static/evfi-badge-genesis.svg" alt="{escape(str(mission["mission_type"]))} badge">
+            <div>
+                <strong>{escape(str(mission["mission_type"]).replace("_", " ").title())}</strong>
+                <div class="sub">Complete</div>
             </div>
-            <div class="activity-source">{escape(source)}</div>
-            <div class="activity-details">{details_text}</div>
         </div>
         """
-    if not activity_rows:
-        activity_rows = "<div class='sub'>No gamification activity yet.</div>"
+        for mission in completed_missions[:4]
+    ) or "<div class='sub'>Complete missions to unlock more badges.</div>"
+
+    score_breakdown_rows = [
+        ("Verified Miles", fmt2(weekly_score_breakdown["verifiedMiles"]), "scoreBreakdownVerifiedMiles"),
+        ("Active Days", str(weekly_score_breakdown["activeDays"]), "scoreBreakdownActiveDays"),
+        ("Participation Bonus", fmt2(weekly_score_breakdown["participationBonus"]), "scoreBreakdownParticipationBonus"),
+        ("Efficiency Score", fmt2(weekly_score_breakdown["efficiencyScore"]), "scoreBreakdownEfficiencyScore"),
+        ("Charge Sessions", str(weekly_score_breakdown["chargeSessions"]), "scoreBreakdownChargeSessions"),
+        ("Charging Score", fmt2(weekly_score_breakdown["chargingScore"]), "scoreBreakdownChargingScore"),
+        ("Mission Bonus", fmt2(weekly_score_breakdown["missionBonus"]), "scoreBreakdownMissionBonus"),
+        ("Penalty Score", fmt2(weekly_score_breakdown["penaltyScore"]), "scoreBreakdownPenaltyScore"),
+        ("Streak Multiplier", f'{weekly_score_breakdown["streakMultiplier"]:.2f}x', "scoreBreakdownStreakMultiplier"),
+        ("Staking Boost", f'{weekly_score_breakdown["stakingBoostPct"]:.2f}%', "scoreBreakdownStakingBoostPct"),
+        ("Staking Bonus", fmt2(weekly_score_breakdown["stakingBonus"]), "scoreBreakdownStakingBonus"),
+        ("Avg Wh/mi", fmt2(weekly_score_breakdown["avgEfficiencyWhmi"]), "scoreBreakdownAvgEfficiency"),
+        ("Baseline Wh/mi", fmt2(weekly_score_breakdown["baselineEfficiencyWhmi"]), "scoreBreakdownBaselineEfficiency"),
+        ("Healthy Charges", str(weekly_score_breakdown["healthyChargeSessions"]), "scoreBreakdownHealthyCharges"),
+        ("High SoC Charges", str(weekly_score_breakdown["highSocChargeSessions"]), "scoreBreakdownHighSocCharges"),
+        ("Pre-Bonus Score", fmt2(weekly_score_breakdown["preBonusScore"]), "scoreBreakdownPreBonus"),
+        ("Emission Factor", f'{weekly_reward_preview["emissionFactor"]:.6f}', "scoreBreakdownEmissionFactor"),
+        ("Weekly EVFi Estimate", fmt2(weekly_reward_preview["estimatedEvfi"]), "scoreBreakdownWeeklyEvfi"),
+        ("Total Score", fmt2(weekly_score_breakdown["totalScore"]), "scoreBreakdownTotalScore"),
+    ]
+    score_breakdown_html = "".join(
+        f"""
+        <div class="score-breakdown-item">
+            <div class="score-breakdown-label">{label}</div>
+            <div id="{element_id}" class="score-breakdown-value">{escape(value)}</div>
+        </div>
+        """
+        for label, value, element_id in score_breakdown_rows
+    )
+    score_explanation_html = "".join(
+        f'<li class="score-explanation-item">{escape(item)}</li>'
+        for item in weekly_score_explanations
+    ) or "<li class='score-explanation-item'>Sync the vehicle to generate this week&apos;s reward explanations.</li>"
+    utility_card_html = "".join(
+        f"""
+        <div class="utility-card">
+            <div class="utility-card-label">{escape(entry["label"])}</div>
+            <div class="utility-card-value">{fmt2(entry.get("costEvfi", entry.get("stakeEvfi", 0)))} EVFi</div>
+            <div class="utility-card-copy">{escape(entry["description"])}</div>
+            <button
+                class="utility-action-button"
+                type="button"
+                data-action-type="{escape(entry["actionType"])}"
+                data-action-key="{escape(entry["key"])}"
+                data-stake-evfi="{escape(str(entry.get("stakeEvfi", "")))}"
+            >{'Set Stake Amount' if entry["actionType"] == 'onchain_stake_hint' else 'Use EVFi'}</button>
+        </div>
+        """
+        for group in ("analyticsUnlocks", "partnerRewards")
+        for entry in token_utility["catalog"][group]
+    )
 
     body = f"""
+    <section class="dashboard-brand-banner" aria-label="EVFi banner"></section>
+
     <section class="topbar">
         <section class="vehicle-panel">
             <div class="vehicle-header">
@@ -4269,8 +5912,8 @@ def dashboard(vid):
                     <h2 class="vehicle-title">{escape(display_name)}</h2>
                     <div class="vehicle-sub">{escape(str(year))} {escape(model)} • {escape(trim)} • {escape(str(vehicle_state).title())}</div>
                 </div>
-                <div class="tesla-mark" aria-label="EVFI logo">
-                    <img class="vehicle-brand-logo" src="/static/evfi-token-logo.png" alt="EVFI token logo">
+                <div class="tesla-mark" aria-label="EVFi logo">
+                    <img class="vehicle-brand-logo" src="/static/evfi-token-logo.png" alt="EVFi token logo">
                 </div>
             </div>
 
@@ -4287,19 +5930,19 @@ def dashboard(vid):
             {car_visual_html}
 
             <div class="quick-actions">
-                <button class="quick-btn" onclick="window.location.href='/sync/{vid}'">Sync Miles</button>
-                <button id="refreshAndDistributeButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{build_demo_assignment_amount(summary)}">Sync + Airdrop</button>
+                <button id="syncMilesButton" class="quick-btn" data-vehicle-id="{vid}">Sync Miles</button>
+                <button id="refreshAndDistributeButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{weekly_reward_preview["estimatedEvfi"]}">Sync + Weekly EVFi</button>
                 <button class="quick-btn" onclick="window.location.href='/vehicle/{vid}/raw'">Raw Data</button>
-                <button id="claimRewardsButton" class="quick-btn">Claim EVFI</button>
+                <button id="claimRewardsButton" class="quick-btn">Claim EVFi</button>
                 <button id="claimAirdropButton" class="quick-btn" data-vehicle-id="{vid}" data-airdrop-amount="{airdrop_amount}">{escape(airdrop_status)}</button>
                 <button id="sportModeButton" class="quick-btn {'sport-active' if sport_active else ''}" data-vehicle-id="{vid}" data-active="{'true' if sport_active else 'false'}" data-end-time="{int(user['sport_mode_end_time'] or 0)}">SPORT MODE</button>
-                <button id="assignRewardsButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{build_demo_assignment_amount(summary)}">Assign Test EVFI</button>
+                <button id="assignRewardsButton" class="quick-btn" data-vehicle-id="{vid}" data-default-amount="{weekly_reward_preview["estimatedEvfi"]}">Assign Test EVFi</button>
                 <button class="quick-btn" onclick="alert('Vehicle controls can be wired next')">Controls</button>
             </div>
             <div id="sportModeStatus" class="status-pill" data-state="{'sport-active' if sport_active else 'sport-inactive'}">{'SPORT MODE ACTIVE - ' + str(sport_countdown) + 's remaining' if sport_active else 'Sport Mode available: 15 minutes, 1 use per day.'}</div>
             <div class="admin-stack">
                 <input id="distributionRecipientInput" class="admin-input" type="text" value="{escape(DEFAULT_WALLET_ADDRESS)}" placeholder="Distribution recipient wallet 0x...">
-                <input id="adminKeyInput" class="admin-input" type="password" placeholder="Admin API key">
+                <input id="adminKeyInput" class="admin-input" type="password" placeholder="Admin API key for manual test assignment only">
             </div>
 
             <div class="charge-card">
@@ -4308,7 +5951,7 @@ def dashboard(vid):
                     <div class="muted">{escape(str(charging_state))}</div>
                 </div>
 
-                <div class="charge-meta">
+                <div id="vehicleChargeMeta" class="charge-meta">
                     {charge_rate} kW • {charger_actual_current}A • {charger_voltage}V • Last sync {escape(last_synced_str)}
                 </div>
 
@@ -4328,7 +5971,7 @@ def dashboard(vid):
 
             <div class="header-links">
                 <a class="soft-link" href="/">Back</a>
-                <a class="soft-link" href="/sync/{vid}">Refresh Rewards</a>
+                <a id="refreshRewardsLink" class="soft-link" href="/sync/{vid}" data-vehicle-id="{vid}">Refresh Rewards</a>
                 <a class="soft-link" href="/vehicle/{vid}/raw">Telemetry</a>
             </div>
         </section>
@@ -4337,7 +5980,7 @@ def dashboard(vid):
             <div class="wallet-panel-header">
                 <div>
                     <div class="label">Wallet & Rewards</div>
-                    <h2 class="wallet-panel-title">Sepolia EVFI</h2>
+                    <h2 class="wallet-panel-title">Sepolia EVFi</h2>
                     <p class="wallet-panel-copy">Connect your test wallet, review live ERC-20 balance, and claim pending rewards without leaving the dashboard.</p>
                 </div>
                 <div id="walletConnectionBadge" class="wallet-badge" data-state="idle">Not Connected</div>
@@ -4348,17 +5991,18 @@ def dashboard(vid):
                     <span class="wallet-btn-icon" aria-hidden="true"></span>
                     <span id="connectWalletButtonLabel" class="wallet-btn-label">Connect Sepolia Wallet</span>
                 </button>
+                <button id="addTokenButton" class="wallet-link wallet-link-button" type="button">Add EVFi to MetaMask</button>
                 <button id="disconnectWalletButton" class="wallet-link wallet-link-button is-hidden" type="button">Disconnect</button>
             </div>
 
             <div class="wallet-grid">
                 <div class="wallet-stat">
-                    <div class="wallet-stat-label">Wallet EVFI Balance</div>
+                    <div class="wallet-stat-label">Wallet EVFi Balance</div>
                     <div id="walletBalanceValue" class="wallet-stat-value">0.0</div>
                     <div class="sub">Live Sepolia token balance.</div>
                 </div>
                 <div class="wallet-stat">
-                    <div class="wallet-stat-label">Claimable EVFI</div>
+                    <div class="wallet-stat-label">Claimable EVFi</div>
                     <div id="claimableRewardsValue" class="wallet-stat-value">0.0</div>
                     <div class="sub">Pending rewards ready to claim.</div>
                 </div>
@@ -4372,12 +6016,14 @@ def dashboard(vid):
 
             <div class="wallet-links">
                 <a id="walletExplorerLink" class="wallet-link is-hidden" href="#" target="_blank" rel="noreferrer">Wallet Explorer</a>
-                <a id="tokenExplorerLink" class="wallet-link {'' if EVFI_TOKEN_ADDRESS else 'is-hidden'}" href="https://sepolia.etherscan.io/address/{escape(EVFI_TOKEN_ADDRESS)}" target="_blank" rel="noreferrer">EVFI Token</a>
+                <a id="tokenExplorerLink" class="wallet-link {'' if EVFI_TOKEN_ADDRESS else 'is-hidden'}" href="https://sepolia.etherscan.io/address/{escape(EVFI_TOKEN_ADDRESS)}" target="_blank" rel="noreferrer">EVFi Token</a>
                 <a id="rewardsExplorerLink" class="wallet-link {'' if EVFI_REWARDS_ADDRESS else 'is-hidden'}" href="https://sepolia.etherscan.io/address/{escape(EVFI_REWARDS_ADDRESS)}" target="_blank" rel="noreferrer">Rewards Vault</a>
-                <a id="txExplorerLink" class="wallet-link is-hidden" href="#" target="_blank" rel="noreferrer">Latest EVFI Tx</a>
+                <a class="wallet-link {'' if staking_contract_address else 'is-hidden'}" href="https://sepolia.etherscan.io/address/{escape(staking_contract_address)}" target="_blank" rel="noreferrer">Staking Contract</a>
+                <a class="wallet-link {'' if generated_fees_pool_address else 'is-hidden'}" href="https://sepolia.etherscan.io/address/{escape(generated_fees_pool_address)}" target="_blank" rel="noreferrer">Generated Fees Pool</a>
+                <a id="txExplorerLink" class="wallet-link is-hidden" href="#" target="_blank" rel="noreferrer">Latest EVFi Tx</a>
             </div>
 
-            <div id="walletConnectHint" class="wallet-hint">Sepolia contracts are connected. Link your wallet to unlock live EVFI balance reads and claim flow.</div>
+            <div id="walletConnectHint" class="wallet-hint">Sepolia contracts are connected. Link your wallet to unlock live EVFi balance reads and claim flow.</div>
             <div id="walletToast" class="inline-toast" data-tone="success"></div>
 
             <div class="token-metrics-panel">
@@ -4388,23 +6034,59 @@ def dashboard(vid):
                     <div><span>Circulating</span><strong id="mockCirculatingSupply">100,000,000.00</strong></div>
                     <div><span>Max Supply</span><strong>1,000,000,000.00</strong></div>
                 </div>
-                <div class="mock-chart" id="mockPriceChart" aria-label="EVFI price candle chart"></div>
+                <div class="mock-chart" id="mockPriceChart" aria-label="EVFi price candle chart"></div>
             </div>
         </section>
+    </section>
+
+    <section class="panel secondary-card utility-panel" style="margin-top:16px;">
+        <div class="label">EVFi Utility</div>
+        <h3 class="secondary-card-title">Unlock & Stake</h3>
+        <p class="secondary-card-copy">Stake EVFi through the Sepolia contract and unlock digital in-app perks. Physical perk previews are hidden for now.</p>
+        <div id="onchainStakingMount"></div>
+        <div class="utility-grid">
+            {utility_card_html}
+        </div>
     </section>
 
     <section class="stats-grid v2-score-grid">
         <section class="panel secondary-card score-card">
             <div class="label">Weekly Score</div>
-            <h3 class="secondary-card-title value-tone-{value_tone(weekly_score["total_score"] if weekly_score else 0)}" data-count-up="{fmt2(weekly_score["total_score"] if weekly_score else 0)}">{fmt2(weekly_score["total_score"] if weekly_score else 0)} pts</h3>
-            <p class="secondary-card-copy">Verified miles, active days, charge health, streak multiplier, and mission bonuses.</p>
-            <div class="sub">Updated {escape(score_updated_str)}</div>
+            <h3 id="weeklyScoreValue" class="secondary-card-title value-tone-{value_tone(weekly_score["total_score"] if weekly_score else 0)}" data-count-up="{fmt2(weekly_score["total_score"] if weekly_score else 0)}">{fmt2(weekly_score["total_score"] if weekly_score else 0)} pts</h3>
+            <p class="secondary-card-copy">Verified miles, activity consistency, efficiency trends, charging behavior, penalties, and mission bonuses.</p>
+            <div class="score-card-metrics">
+                <div class="score-mini-metric"><span>Miles</span><strong>{fmt2(weekly_score_breakdown["verifiedMiles"])}</strong></div>
+                <div class="score-mini-metric"><span>Stake Boost</span><strong>{weekly_score_breakdown["stakingBoostPct"]:.2f}%</strong></div>
+            </div>
+            <div id="weeklyScoreUpdatedAt" class="sub">Updated {escape(score_updated_str)}</div>
+        </section>
+
+        <section class="panel secondary-card score-breakdown-card">
+            <div class="label">Score Breakdown</div>
+            <h3 class="secondary-card-title">Weekly Inputs</h3>
+            <p class="secondary-card-copy">The weekly EVFi estimate comes from these inputs, then the network emission factor converts score into claimable EVFi.</p>
+            <div class="score-breakdown-grid">
+                {score_breakdown_html}
+            </div>
+        </section>
+
+        <section class="panel secondary-card score-explain-card">
+            <div class="label">Why Your Reward Changed</div>
+            <h3 class="secondary-card-title">Weekly Reward Explanation</h3>
+            <p class="secondary-card-copy">This translates the score engine into plain English so users can understand what helped or hurt weekly EVFi.</p>
+            <ul id="scoreExplanationList" class="score-explanation-list">
+                {score_explanation_html}
+            </ul>
         </section>
 
         <section class="panel secondary-card streak-card">
             <div class="label">Active Streak</div>
             <h3 class="secondary-card-title"><span id="currentStreakValue">{int(gamification["state"].get("current_streak") or 0)}</span> day streak</h3>
             <p class="secondary-card-copy">Longest: <span id="longestStreakValue">{int(gamification["state"].get("longest_streak") or 0)}</span> days</p>
+            <div class="streak-metrics">
+                <div class="streak-mini-metric"><span>Active Days</span><strong>{weekly_score_breakdown["activeDays"]}</strong></div>
+                <div class="streak-mini-metric"><span>Multiplier</span><strong>{weekly_score_breakdown["streakMultiplier"]:.2f}x</strong></div>
+            </div>
             <div id="streakUpdatedAt" class="sub">Updated {escape(gamification_updated_str)}</div>
         </section>
 
@@ -4417,70 +6099,35 @@ def dashboard(vid):
 
         <section class="panel secondary-card distribution-card">
             <div class="label">Last Distribution</div>
-            <h3 class="secondary-card-title value-tone-{value_tone(last_distribution["evfi_allocated"] if last_distribution else 0)}" data-count-up="{fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)}">{last_distribution_value} EVFI</h3>
+            <h3 class="secondary-card-title value-tone-{value_tone(last_distribution["evfi_allocated"] if last_distribution else 0)}" data-count-up="{fmt2(last_distribution["evfi_allocated"] if last_distribution else 0)}">{last_distribution_value} EVFi</h3>
             <p class="secondary-card-copy">Fixed-pool deterministic allocation with weekly caps.</p>
-            <div class="badge-display">
-                <img class="nft-badge" src="{escape(badge_asset)}" alt="Generated achievement badge">
-                <div>
-                    <div class="badge-label">{escape(badge_label)}</div>
-                    <div class="sub">Achievement badge attached to the latest completed challenge.</div>
-                </div>
-            </div>
+            <div class="achievement-strip">{achievement_badge_html}</div>
             <div class="sub">Updated {escape(distribution_updated_str)}</div>
         </section>
     </section>
 
-    <section class="stats-grid">
-        <section class="panel secondary-card">
-            <div class="label">Vehicle Summary</div>
-            <h3 class="secondary-card-title">{escape(display_name)}</h3>
-            <p class="secondary-card-copy">{escape(str(year))} {escape(model)} • {escape(trim)} • {escape(str(vehicle_state).title())}</p>
-
-            <div class="summary-grid">
-                <div class="summary-item wide">
-                    <div class="summary-label">Full VIN</div>
-                    <div class="summary-value">{escape(vin)}</div>
-                </div>
-                <div class="summary-item">
-                    <div class="summary-label">Odometer</div>
-                    <div class="summary-value">{current_odometer:.1f}</div>
-                </div>
-                <div class="summary-item">
-                    <div class="summary-label">Last Sync</div>
-                    <div class="summary-value">{escape(last_synced_str)}</div>
-                </div>
-                <div class="summary-item">
-                    <div class="summary-label">Exterior</div>
-                    <div class="summary-value">{escape(str(exterior_color))}</div>
-                </div>
-                <div class="summary-item">
-                    <div class="summary-label">Wheel Type</div>
-                    <div class="summary-value">{escape(str(wheel_type))}</div>
-                </div>
-            </div>
-        </section>
-
-        <section class="panel secondary-card">
-            <div class="label">Mileage / Distribution</div>
-            <h3 class="secondary-card-title">Weekly EVFI Output</h3>
-            <p class="secondary-card-copy">Mileage stays offchain. This module surfaces the current reward math and the test airdrop amount used by the assignment tools.</p>
+    <section class="stats-grid reward-engine-grid">
+        <section class="panel secondary-card reward-engine-card">
+            <div class="label">Weekly Reward Engine</div>
+            <h3 class="secondary-card-title">Estimated Weekly EVFi</h3>
+            <p class="secondary-card-copy">A single offchain weekly score drives emissions. Sync updates telemetry, weekly score, and the current EVFi estimate. The onboarding airdrop remains a separate one-time grant.</p>
 
             <div class="distribution-grid">
                 <div class="distribution-stat">
-                    <div class="distribution-label">Telemetry Score</div>
-                    <div class="distribution-value value-tone-{value_tone(summary["drv_balance"])}">{fmt2_grouped(summary["drv_balance"])}</div>
+                    <div class="distribution-label">Weekly Score</div>
+                    <div id="telemetryScoreValue" class="distribution-value value-tone-{value_tone(weekly_score["total_score"] if weekly_score else 0)}">{fmt2_grouped(weekly_score["total_score"] if weekly_score else 0)}</div>
                 </div>
                 <div class="distribution-stat">
-                    <div class="distribution-label">Miles Tracked</div>
-                    <div class="distribution-value value-tone-{value_tone(summary["total_miles"])}">{fmt2_grouped(summary["total_miles"])}</div>
+                    <div class="distribution-label">Tracked Miles</div>
+                    <div id="milesTrackedValue" class="distribution-value value-tone-{value_tone(summary["total_miles"])}">{fmt2_grouped(summary["total_miles"])}</div>
                 </div>
                 <div class="distribution-stat">
-                    <div class="distribution-label">Airdrop Amount</div>
-                    <div class="distribution-value value-tone-{value_tone(build_demo_assignment_amount(summary))}">{fmt2_grouped(build_demo_assignment_amount(summary))}</div>
+                    <div class="distribution-label">Weekly EVFi Estimate</div>
+                    <div id="airdropAmountValue" class="distribution-value value-tone-{value_tone(weekly_reward_preview["estimatedEvfi"])}">{weekly_reward_estimate}</div>
                 </div>
             </div>
 
-            <div class="sub">Use <strong>Assign Test EVFI</strong> for a manual pending reward, or <strong>Sync + Airdrop</strong> to refresh mileage and assign the newly computed amount in one step.</div>
+            <div class="sub">Use <strong>Assign Test EVFi</strong> for manual testing, <strong>Sync + Weekly EVFi</strong> to refresh telemetry and assign the current weekly reward, and <strong>Airdrop Available</strong> only for the fixed onboarding grant.</div>
         </section>
     </section>
 
@@ -4494,7 +6141,9 @@ def dashboard(vid):
                     <th>Miles Added</th>
                     <th>Score Added</th>
                 </tr>
-                {events_rows}
+                <tbody id="rewardSyncHistoryBody">
+                    {events_rows}
+                </tbody>
             </table>
         </section>
 
@@ -4507,23 +6156,41 @@ def dashboard(vid):
                 <tr><th>Year</th><td>{escape(str(year))}</td></tr>
                 <tr><th>VIN</th><td>{escape(vin)}</td></tr>
                 <tr><th>Vehicle State</th><td>{escape(str(vehicle_state))}</td></tr>
-                <tr><th>Odometer</th><td>{current_odometer:.1f}</td></tr>
+                <tr><th>Odometer</th><td id="vehicleDetailsOdometer">{current_odometer:.1f}</td></tr>
                 <tr><th>Location</th><td>{latitude}, {longitude}</td></tr>
                 <tr><th>Exterior Color</th><td>{escape(str(exterior_color))}</td></tr>
-                <tr><th>Wheel Type</th><td>{escape(str(wheel_type))}</td></tr>
-                <tr><th>Default Wallet</th><td>{escape(DEFAULT_WALLET_ADDRESS)}</td></tr>
-                <tr><th>EvFiToken</th><td>{escape(EVFI_TOKEN_ADDRESS or "Not configured")}</td></tr>
-                <tr><th>EvFiRewards</th><td>{escape(EVFI_REWARDS_ADDRESS or "Not configured")}</td></tr>
+                <tr><th>Wheel Type</th><td>{escape(display_wheel_type)}</td></tr>
             </table>
         </section>
     </section>
 
-    <section class="panel activity-panel">
-        <h3 class="history-title">Gamification Activity</h3>
-        <div class="activity-list">
-            {activity_rows}
+    <section class="panel contracts-panel" style="margin-top:16px;">
+        <div class="label">Sepolia Contracts</div>
+        <h3 class="secondary-card-title">Wallet & Contract References</h3>
+        <div class="contracts-grid">
+            <div class="contract-item">
+                <div class="contract-label">Default Wallet</div>
+                <div class="contract-value">{escape(DEFAULT_WALLET_ADDRESS)}</div>
+            </div>
+            <div class="contract-item">
+                <div class="contract-label">EVFi Token</div>
+                <div class="contract-value">{escape(EVFI_TOKEN_ADDRESS or "Not configured")}</div>
+            </div>
+            <div class="contract-item">
+                <div class="contract-label">Rewards Vault</div>
+                <div class="contract-value">{escape(EVFI_REWARDS_ADDRESS or "Not configured")}</div>
+            </div>
+            <div class="contract-item">
+                <div class="contract-label">Staking Contract</div>
+                <div class="contract-value">{escape(staking_contract_address or "Not configured")}</div>
+            </div>
+            <div class="contract-item">
+                <div class="contract-label">Generated Fees Pool</div>
+                <div class="contract-value">{escape(generated_fees_pool_address or "Not configured")}</div>
+            </div>
         </div>
     </section>
+
     """
     return render_page(f"{display_name} Dashboard", body)
 
@@ -4546,6 +6213,34 @@ def sync_rewards(vid):
     return redirect(url_for("dashboard", vid=vid))
 
 
+@app.route("/api/vehicle/<vid>/sync", methods=["POST"])
+def sync_rewards_api(vid):
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if wallet and not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid wallet is required"}), 400
+
+    log_v2_event("dashboard_sync_requested", vehicle_id=str(vid), wallet=wallet)
+    try:
+        context = load_vehicle_and_summary(vid, wallet_address=wallet)
+    except ValueError:
+        return jsonify({"error": "Vehicle not found"}), 404
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    response_payload = build_dashboard_sync_payload(vid, wallet, context)
+    recent_event = response_payload["events"][0] if response_payload["events"] else {}
+    log_v2_event(
+        "dashboard_sync_completed",
+        vehicle_id=str(vid),
+        wallet=wallet,
+        current_odometer=response_payload["odometer"],
+        miles_added=recent_event.get("milesAdded", 0.0),
+        reward_added=recent_event.get("scoreAdded", 0.0),
+    )
+    return jsonify(response_payload)
+
+
 @app.route("/api/vehicle/<vid>/summary")
 def vehicle_summary_api(vid):
     try:
@@ -4557,15 +6252,17 @@ def vehicle_summary_api(vid):
 
     meta = context["meta"]
     summary = context["summary"]
+    user = get_or_create_user(DEFAULT_WALLET_ADDRESS)
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], context["vin"], str(vid))
 
     return jsonify(
         {
             "vehicleId": str(vid),
             "displayName": meta["display_name"],
             "walletDefault": DEFAULT_WALLET_ADDRESS,
-            "telemetryScore": float(summary["drv_balance"] or 0),
+            "telemetryScore": float(weekly_reward_preview["weeklyScore"] or 0),
             "totalMiles": float(summary["total_miles"] or 0),
-            "recommendedAssignment": build_demo_assignment_amount(summary),
+            "recommendedAssignment": weekly_reward_preview["estimatedEvfi"],
         }
     )
 
@@ -4584,6 +6281,7 @@ def vehicle_gamification_api(vid):
         return jsonify({"error": str(exc)}), 500
 
     user = get_or_create_user(wallet)
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], context["vin"], str(vid))
     activity = record_app_activity(user["id"], "reward_check")
     gamification = getGamificationState(user["id"])
     return jsonify(
@@ -4591,7 +6289,7 @@ def vehicle_gamification_api(vid):
             "ok": True,
             "vehicleId": str(vid),
             "wallet": wallet,
-            "telemetryScore": float(context["summary"]["drv_balance"] or 0),
+            "telemetryScore": float(weekly_reward_preview["weeklyScore"] or 0),
             "totalMiles": float(context["summary"]["total_miles"] or 0),
             "gamification": gamification,
             "gamificationEvents": activity["events"],
@@ -4619,10 +6317,11 @@ def assign_demo_reward(vid):
         return jsonify({"error": str(exc)}), 500
 
     summary = context["summary"]
-    amount_tokens = float(payload.get("amountTokens") or build_demo_assignment_amount(summary))
+    user = get_or_create_user(wallet)
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], context["vin"], str(vid))
+    amount_tokens = float(payload.get("amountTokens") or weekly_reward_preview["estimatedEvfi"])
     batch_id = str(payload.get("batchId") or build_distribution_batch_id(vid, "demo"))
 
-    user = get_or_create_user(wallet)
     try:
         output = assign_demo_reward_onchain(wallet, amount_tokens, batch_id)
     except Exception as exc:
@@ -4641,7 +6340,7 @@ def assign_demo_reward(vid):
             "wallet": wallet,
             "amountTokens": amount_tokens,
             "batchId": batch_id,
-            "telemetryScore": float(summary["drv_balance"] or 0),
+            "telemetryScore": float(weekly_reward_preview["weeklyScore"] or 0),
             "txHash": output.get("txHash"),
             "output": output,
             "gamification": gamification,
@@ -4652,9 +6351,6 @@ def assign_demo_reward(vid):
 
 @app.route("/api/vehicle/<vid>/refresh-and-distribute", methods=["POST"])
 def refresh_and_distribute_reward(vid):
-    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
     if not os.path.exists(EVFI_ASSIGN_SCRIPT):
         return jsonify({"error": f"Missing reward assignment script: {EVFI_ASSIGN_SCRIPT}"}), 500
 
@@ -4662,6 +6358,9 @@ def refresh_and_distribute_reward(vid):
     wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
     if not is_valid_evm_address(wallet):
         return jsonify({"error": "A valid recipient wallet is required"}), 400
+    authorized, auth_error = verify_admin_or_wallet_signature(wallet, "refresh-and-distribute", vid)
+    if not authorized:
+        return jsonify({"error": auth_error or "Unauthorized"}), 401
     try:
         context = load_vehicle_and_summary(vid, wallet_address=wallet)
     except ValueError:
@@ -4676,6 +6375,7 @@ def refresh_and_distribute_reward(vid):
         return jsonify({"error": "VIN is already bound to another wallet"}), 409
 
     weekly_score = calculate_weekly_score(user["id"], context["vin"], str(vid))
+    weekly_reward_preview = build_weekly_reward_preview(user["id"], context["vin"], str(vid))
     claim = distribute_weekly_pool(user["id"], weekly_score["week_start"], weekly_score["week_end"])
     amount_tokens = float(claim["evfi_allocated"] or 0)
     batch_id = str(payload.get("batchId") or build_distribution_batch_id(vid, "weekly"))
@@ -4702,7 +6402,7 @@ def refresh_and_distribute_reward(vid):
             "wallet": wallet,
             "amountTokens": amount_tokens,
             "batchId": batch_id,
-            "telemetryScore": float(summary["drv_balance"] or 0),
+            "telemetryScore": float(weekly_reward_preview["weeklyScore"] or 0),
             "weeklyScore": float(weekly_score["total_score"] or 0),
             "totalMiles": float(summary["total_miles"] or 0),
             "txHash": output.get("txHash"),
@@ -4715,13 +6415,13 @@ def refresh_and_distribute_reward(vid):
 
 @app.route("/api/vehicle/<vid>/claim-airdrop", methods=["POST"])
 def claim_airdrop(vid):
-    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
-
     payload = request.get_json(silent=True) or {}
     wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
     if not is_valid_evm_address(wallet):
         return jsonify({"error": "A valid recipient wallet is required"}), 400
+    authorized, auth_error = verify_admin_or_wallet_signature(wallet, "claim-airdrop", vid)
+    if not authorized:
+        return jsonify({"error": auth_error or "Unauthorized"}), 401
 
     try:
         context = load_vehicle_and_summary(vid, wallet_address=wallet)
@@ -4780,6 +6480,118 @@ def claim_airdrop(vid):
             "output": output,
             "gamification": gamification,
             "gamificationEvents": activity["events"],
+        }
+    )
+
+
+@app.route("/api/vehicle/<vid>/utility/redeem", methods=["POST"])
+def redeem_utility_api(vid):
+    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    action_key = str(payload.get("actionKey") or "")
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid wallet is required"}), 400
+    if not action_key:
+        return jsonify({"error": "A utility action key is required"}), 400
+
+    user = get_or_create_user(wallet)
+    try:
+        result = redeem_token_utility(user["id"], action_key)
+        reward_context = get_cached_vehicle_reward_context(vid)
+        weekly_score = calculate_weekly_score(user["id"], reward_context["vin"], str(vid))
+        weekly_reward_preview = build_weekly_reward_preview(user["id"], reward_context["vin"], str(vid))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify(
+        {
+            "ok": True,
+            "wallet": wallet,
+            "actionKey": action_key,
+            "amountEvfi": result["amountEvfi"],
+            "utilityState": result["utilityState"],
+            "weeklyScore": {
+                "totalScore": float(weekly_score["total_score"] or 0),
+                "breakdown": extract_weekly_score_breakdown(weekly_score),
+                "explanations": build_weekly_reward_explanations(parse_json_object(weekly_score["score_breakdown_json"] or "{}"), weekly_reward_preview),
+            },
+            "rewardPreview": weekly_reward_preview,
+        }
+    )
+
+
+@app.route("/api/vehicle/<vid>/utility/stake", methods=["POST"])
+def stake_utility_api(vid):
+    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    tier_key = str(payload.get("tierKey") or "")
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid wallet is required"}), 400
+    if not tier_key:
+        return jsonify({"error": "A staking tier key is required"}), 400
+
+    user = get_or_create_user(wallet)
+    try:
+        result = stake_evfi_tier(user["id"], tier_key)
+        reward_context = get_cached_vehicle_reward_context(vid)
+        weekly_score = calculate_weekly_score(user["id"], reward_context["vin"], str(vid))
+        weekly_reward_preview = build_weekly_reward_preview(user["id"], reward_context["vin"], str(vid))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify(
+        {
+            "ok": True,
+            "wallet": wallet,
+            "tierKey": tier_key,
+            "utilityState": result["utilityState"],
+            "weeklyScore": {
+                "totalScore": float(weekly_score["total_score"] or 0),
+                "breakdown": extract_weekly_score_breakdown(weekly_score),
+                "explanations": build_weekly_reward_explanations(parse_json_object(weekly_score["score_breakdown_json"] or "{}"), weekly_reward_preview),
+            },
+            "rewardPreview": weekly_reward_preview,
+        }
+    )
+
+
+@app.route("/api/vehicle/<vid>/utility/unstake", methods=["POST"])
+def unstake_utility_api(vid):
+    if request.headers.get("x-admin-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    wallet = str(payload.get("wallet") or DEFAULT_WALLET_ADDRESS)
+    if not is_valid_evm_address(wallet):
+        return jsonify({"error": "A valid wallet is required"}), 400
+
+    user = get_or_create_user(wallet)
+    try:
+        result = unstake_evfi(user["id"])
+        reward_context = get_cached_vehicle_reward_context(vid)
+        weekly_score = calculate_weekly_score(user["id"], reward_context["vin"], str(vid))
+        weekly_reward_preview = build_weekly_reward_preview(user["id"], reward_context["vin"], str(vid))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify(
+        {
+            "ok": True,
+            "wallet": wallet,
+            "tierKey": result["tierKey"],
+            "utilityState": result["utilityState"],
+            "weeklyScore": {
+                "totalScore": float(weekly_score["total_score"] or 0),
+                "breakdown": extract_weekly_score_breakdown(weekly_score),
+                "explanations": build_weekly_reward_explanations(parse_json_object(weekly_score["score_breakdown_json"] or "{}"), weekly_reward_preview),
+            },
+            "rewardPreview": weekly_reward_preview,
         }
     )
 
@@ -4902,6 +6714,526 @@ def well_known(filename):
 def run_app():
     init_db()
     app.run(port=DEFAULT_PORT, debug=False)
+
+
+SEPOLIA_CHAIN_ID = int(os.getenv("SEPOLIA_CHAIN_ID", "11155111"))
+SEPOLIA_RPC_URL = os.getenv("SEPOLIA_RPC_URL", "").strip()
+EVFI_TOKEN_DECIMALS = int(os.getenv("EVFI_TOKEN_DECIMALS", "18"))
+STAKING_TIER_THRESHOLDS = os.getenv(
+    "STAKING_TIER_THRESHOLDS",
+    "100:Bronze:5,500:Silver:10,1000:Gold:15",
+).strip()
+
+try:
+    from web3 import Web3
+except Exception:
+    Web3 = None
+
+
+def get_evfi_token_address():
+    for key in ("EVFI_TOKEN_ADDRESS", "EVFI_CONTRACT_ADDRESS", "TOKEN_CONTRACT_ADDRESS"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def parse_staking_tier_thresholds():
+    thresholds = []
+    for raw_chunk in STAKING_TIER_THRESHOLDS.split(","):
+        chunk = raw_chunk.strip()
+        if not chunk:
+            continue
+        parts = [part.strip() for part in chunk.split(":")]
+        if len(parts) != 3:
+            continue
+        try:
+            minimum_amount = float(parts[0])
+            label = parts[1]
+            boost_pct = float(parts[2])
+        except ValueError:
+            continue
+        thresholds.append(
+            {
+                "minimumAmount": minimum_amount,
+                "label": label,
+                "boostPct": boost_pct,
+            }
+        )
+    thresholds.sort(key=lambda item: item["minimumAmount"])
+    return thresholds
+
+
+def derive_staking_tier(total_staked_evfi):
+    chosen_tier = None
+    for threshold in parse_staking_tier_thresholds():
+        if total_staked_evfi + 1e-9 >= threshold["minimumAmount"]:
+            chosen_tier = threshold
+    return chosen_tier
+
+
+def get_user_wallet_address(user_id):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        for column_name in ("wallet_address", "wallet"):
+            try:
+                row = cur.execute(
+                    f"SELECT {column_name} FROM users WHERE id = ?",
+                    (user_id,),
+                ).fetchone()
+            except Exception:
+                continue
+            if row and row[0]:
+                return str(row[0]).strip()
+    finally:
+        conn.close()
+    return ""
+
+
+def find_user_id_by_wallet_address(wallet_address):
+    normalized_wallet = (wallet_address or "").strip().lower()
+    if not normalized_wallet:
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        for column_name in ("wallet_address", "wallet"):
+            try:
+                row = cur.execute(
+                    f"SELECT id FROM users WHERE lower({column_name}) = ?",
+                    (normalized_wallet,),
+                ).fetchone()
+            except Exception:
+                continue
+            if row and row[0]:
+                return int(row[0])
+    finally:
+        conn.close()
+    return None
+
+
+def get_staking_contract_read_abi():
+    return [
+        {
+            "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+            "name": "totalStaked",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [{"internalType": "address", "name": "staker", "type": "address"}],
+            "name": "getStakePositionsCount",
+            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "staker", "type": "address"},
+                {"internalType": "uint256", "name": "positionId", "type": "uint256"},
+            ],
+            "name": "getStakePosition",
+            "outputs": [
+                {
+                    "components": [
+                        {"internalType": "uint256", "name": "amount", "type": "uint256"},
+                        {"internalType": "uint64", "name": "startTime", "type": "uint64"},
+                        {"internalType": "uint64", "name": "unlockTime", "type": "uint64"},
+                    ],
+                    "internalType": "struct EVFIStaking.StakePosition",
+                    "name": "",
+                    "type": "tuple",
+                }
+            ],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"internalType": "address", "name": "staker", "type": "address"},
+                {"internalType": "uint256", "name": "positionId", "type": "uint256"},
+                {"internalType": "uint256", "name": "amount", "type": "uint256"},
+            ],
+            "name": "previewUnstake",
+            "outputs": [
+                {"internalType": "uint256", "name": "returnedAmount", "type": "uint256"},
+                {"internalType": "uint256", "name": "penaltyAmount", "type": "uint256"},
+                {"internalType": "bool", "name": "early", "type": "bool"},
+            ],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [],
+            "name": "earlyUnstakePenaltyBps",
+            "outputs": [{"internalType": "uint16", "name": "", "type": "uint16"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+    ]
+
+
+def get_staking_web3():
+    if not Web3 or not SEPOLIA_RPC_URL:
+        return None
+    try:
+        web3_client = Web3(Web3.HTTPProvider(SEPOLIA_RPC_URL))
+        if not web3_client.is_connected():
+            return None
+        return web3_client
+    except Exception:
+        return None
+
+
+def build_staking_contract():
+    staking_address = os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip()
+    web3_client = get_staking_web3()
+    if not staking_address or not web3_client:
+        return None, None
+    try:
+        checksum_address = web3_client.to_checksum_address(staking_address)
+        contract = web3_client.eth.contract(
+            address=checksum_address,
+            abi=get_staking_contract_read_abi(),
+        )
+        return web3_client, contract
+    except Exception:
+        return None, None
+
+
+def encode_abi_uint(value):
+    return f"{int(value):064x}"
+
+
+def encode_abi_address(value):
+    address = str(value or "").strip()
+    if not is_valid_evm_address(address):
+        raise ValueError("invalid address")
+    return f"{int(address, 16):064x}"
+
+
+def decode_abi_words(result_hex):
+    value = str(result_hex or "0x")
+    if value.startswith("0x"):
+        value = value[2:]
+    if not value:
+        return []
+    return [int(value[index:index + 64] or "0", 16) for index in range(0, len(value), 64)]
+
+
+def staking_rpc_call(data):
+    staking_address = os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip()
+    if not SEPOLIA_RPC_URL or not staking_address:
+        return []
+    response = requests.post(
+        SEPOLIA_RPC_URL,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": staking_address, "data": data}, "latest"],
+        },
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+    return decode_abi_words(payload.get("result"))
+
+
+def build_onchain_staking_summary_from_rpc(summary, wallet_address):
+    checksumless_wallet = str(wallet_address or "").strip()
+    if not is_valid_evm_address(checksumless_wallet):
+        return summary
+
+    total_staked_raw = staking_rpc_call("0x9bfd8d61" + encode_abi_address(checksumless_wallet))[0]
+    position_count = staking_rpc_call("0xb27a1df6" + encode_abi_address(checksumless_wallet))[0]
+    penalty_bps = staking_rpc_call("0x3a9b0205")[0]
+    total_staked = total_staked_raw / float(10 ** EVFI_TOKEN_DECIMALS)
+    positions = []
+    for position_id in range(int(position_count)):
+        position = staking_rpc_call(
+            "0x2e569eff" + encode_abi_address(checksumless_wallet) + encode_abi_uint(position_id)
+        )
+        amount_raw = int(position[0]) if len(position) > 0 else 0
+        if amount_raw <= 0:
+            continue
+        start_time = int(position[1]) if len(position) > 1 else 0
+        unlock_time = int(position[2]) if len(position) > 2 else 0
+        preview = staking_rpc_call(
+            "0x5ce484b1"
+            + encode_abi_address(checksumless_wallet)
+            + encode_abi_uint(position_id)
+            + encode_abi_uint(amount_raw)
+        )
+        amount = amount_raw / float(10 ** EVFI_TOKEN_DECIMALS)
+        positions.append(
+            {
+                "positionId": position_id,
+                "amount": amount,
+                "startTime": start_time,
+                "unlockTime": unlock_time,
+                "early": bool(preview[2]) if len(preview) > 2 else False,
+                "returnedAmount": (int(preview[0]) if len(preview) > 0 else amount_raw) / float(10 ** EVFI_TOKEN_DECIMALS),
+                "penaltyAmount": (int(preview[1]) if len(preview) > 1 else 0) / float(10 ** EVFI_TOKEN_DECIMALS),
+            }
+        )
+
+    active_tier = derive_staking_tier(total_staked)
+    summary.update(
+        {
+            "enabled": True,
+            "penaltyBps": int(penalty_bps),
+            "totalStaked": total_staked,
+            "positionCount": int(position_count),
+            "positions": positions,
+            "source": "rpc",
+            "activeStake": (
+                {
+                    "tierKey": active_tier["label"].lower(),
+                    "stakeTier": active_tier["label"],
+                    "stakeEvfi": total_staked,
+                    "evfiAmount": total_staked,
+                    "rewardBoostPct": active_tier["boostPct"],
+                    "boostPct": active_tier["boostPct"],
+                }
+                if active_tier
+                else None
+            ),
+        }
+    )
+    return summary
+
+
+def build_onchain_staking_summary(wallet_address):
+    wallet_address = (wallet_address or "").strip()
+    summary = {
+        "enabled": False,
+        "mode": os.getenv("STAKING_MODE", "onchain").strip() or "onchain",
+        "chainId": SEPOLIA_CHAIN_ID,
+        "walletAddress": wallet_address,
+        "contractAddress": os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip(),
+        "generatedFeesPoolAddress": os.getenv("GENERATED_FEES_POOL_ADDRESS", "").strip(),
+        "tokenAddress": get_evfi_token_address(),
+        "penaltyBps": int(os.getenv("EARLY_UNSTAKE_PENALTY_BPS", "1000") or "1000"),
+        "totalStaked": 0.0,
+        "positionCount": 0,
+        "positions": [],
+        "activeStake": None,
+        "thresholds": parse_staking_tier_thresholds(),
+        "source": "unavailable",
+    }
+
+    web3_client, staking_contract = build_staking_contract()
+    if not wallet_address or not web3_client or not staking_contract:
+        try:
+            return build_onchain_staking_summary_from_rpc(summary, wallet_address)
+        except Exception as exc:
+            summary["source"] = f"unavailable:{exc}"
+        return summary
+
+    try:
+        checksum_wallet = web3_client.to_checksum_address(wallet_address)
+        total_staked_raw = int(staking_contract.functions.totalStaked(checksum_wallet).call())
+        position_count = int(staking_contract.functions.getStakePositionsCount(checksum_wallet).call())
+        penalty_bps = int(staking_contract.functions.earlyUnstakePenaltyBps().call())
+        total_staked = total_staked_raw / float(10 ** EVFI_TOKEN_DECIMALS)
+        positions = []
+        for position_id in range(position_count):
+            position = staking_contract.functions.getStakePosition(checksum_wallet, position_id).call()
+            amount_raw = int(position[0])
+            start_time = int(position[1])
+            unlock_time = int(position[2])
+            amount = amount_raw / float(10 ** EVFI_TOKEN_DECIMALS)
+            preview = staking_contract.functions.previewUnstake(
+                checksum_wallet,
+                position_id,
+                amount_raw,
+            ).call()
+            returned_amount = int(preview[0]) / float(10 ** EVFI_TOKEN_DECIMALS)
+            penalty_amount = int(preview[1]) / float(10 ** EVFI_TOKEN_DECIMALS)
+            early = bool(preview[2])
+            positions.append(
+                {
+                    "positionId": position_id,
+                    "amount": amount,
+                    "startTime": start_time,
+                    "unlockTime": unlock_time,
+                    "early": early,
+                    "returnedAmount": returned_amount,
+                    "penaltyAmount": penalty_amount,
+                }
+            )
+
+        active_tier = derive_staking_tier(total_staked)
+        summary.update(
+            {
+                "enabled": True,
+                "penaltyBps": penalty_bps,
+                "totalStaked": total_staked,
+                "positionCount": position_count,
+                "positions": positions,
+                "source": "onchain",
+                "activeStake": (
+                    {
+                        "tierKey": active_tier["label"].lower(),
+                        "stakeTier": active_tier["label"],
+                        "stakeEvfi": total_staked,
+                        "evfiAmount": total_staked,
+                        "rewardBoostPct": active_tier["boostPct"],
+                        "boostPct": active_tier["boostPct"],
+                    }
+                    if active_tier
+                    else None
+                ),
+            }
+        )
+    except Exception as exc:
+        summary["source"] = f"error:{exc}"
+
+    return summary
+
+
+def mirror_onchain_staking_action(wallet_address, action_type, evfi_amount, tx_hash, metadata=None):
+    user_id = find_user_id_by_wallet_address(wallet_address)
+    if not user_id:
+        return False
+
+    status = "confirmed"
+    if tx_hash:
+        web3_client = get_staking_web3()
+        if web3_client:
+            try:
+                receipt = web3_client.eth.get_transaction_receipt(tx_hash)
+                if not receipt or int(receipt.status) != 1:
+                    status = "submitted_unverified"
+            except Exception:
+                status = "submitted_unverified"
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO utility_actions (
+                user_id,
+                action_key,
+                action_type,
+                evfi_amount,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                "onchain_staking",
+                action_type,
+                float(evfi_amount or 0.0),
+                status,
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return True
+
+
+_base_processTelemetrySync = processTelemetrySync
+_base_stake_evfi_tier = stake_evfi_tier
+_base_unstake_evfi = unstake_evfi
+_base_get_user_utility_state = get_user_utility_state
+_base_get_active_stake_boost_pct = get_active_stake_boost_pct
+
+
+def refresh_charge_sessions_from_history():
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM charge_sessions")
+        conn.commit()
+        rebuild_charge_sessions(conn)
+    finally:
+        conn.close()
+
+
+def processTelemetrySync(*args, **kwargs):
+    result = _base_processTelemetrySync(*args, **kwargs)
+    try:
+        refresh_charge_sessions_from_history()
+    except Exception as exc:
+        print(f"[charge-policy] failed to refresh charge sessions after sync: {exc}")
+    return result
+
+
+def stake_evfi_tier(user_id, tier_key):
+    raise RuntimeError("App-level staking is disabled. Use the onchain staking contract flow.")
+
+
+def unstake_evfi(user_id):
+    raise RuntimeError("App-level unstaking is disabled. Use the onchain staking contract flow.")
+
+
+def get_active_stake_boost_pct(user_id):
+    wallet_address = get_user_wallet_address(user_id)
+    summary = build_onchain_staking_summary(wallet_address)
+    active_stake = summary.get("activeStake") or {}
+    return float(active_stake.get("boostPct", 0.0) or 0.0)
+
+
+def get_user_utility_state(user_id):
+    state = _base_get_user_utility_state(user_id)
+    wallet_address = get_user_wallet_address(user_id)
+    onchain_staking = build_onchain_staking_summary(wallet_address)
+    state["stakingMode"] = "onchain"
+    state["onchainStaking"] = onchain_staking
+    if onchain_staking.get("activeStake"):
+        state["activeStake"] = onchain_staking["activeStake"]
+    return state
+
+
+@app.route("/api/staking/config")
+def api_staking_config():
+    return jsonify(
+        {
+            "enabled": bool(os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip()),
+            "chainId": SEPOLIA_CHAIN_ID,
+            "tokenAddress": get_evfi_token_address(),
+            "stakingContractAddress": os.getenv("EVFI_STAKING_CONTRACT_ADDRESS", "").strip(),
+            "generatedFeesPoolAddress": os.getenv("GENERATED_FEES_POOL_ADDRESS", "").strip(),
+            "penaltyBps": int(os.getenv("EARLY_UNSTAKE_PENALTY_BPS", "1000") or "1000"),
+            "tokenDecimals": EVFI_TOKEN_DECIMALS,
+            "thresholds": parse_staking_tier_thresholds(),
+            "lockOptions": [
+                int(value.strip())
+                for value in os.getenv("STAKING_ALLOWED_LOCKS", "21600,86400,604800").split(",")
+                if value.strip()
+            ],
+            "mode": os.getenv("STAKING_MODE", "onchain").strip() or "onchain",
+        }
+    )
+
+
+@app.route("/api/staking/state")
+def api_staking_state():
+    wallet_address = request.args.get("wallet", "").strip()
+    return jsonify(build_onchain_staking_summary(wallet_address))
+
+
+@app.route("/api/staking/audit", methods=["POST"])
+def api_staking_audit():
+    payload = request.get_json(silent=True) or {}
+    mirrored = mirror_onchain_staking_action(
+        payload.get("wallet"),
+        payload.get("action"),
+        payload.get("amount"),
+        payload.get("txHash"),
+        payload,
+    )
+    return jsonify({"ok": True, "mirrored": bool(mirrored)})
 
 
 if __name__ == "__main__":
